@@ -10,7 +10,7 @@ stations = stations.drop(columns=["producer"])
 MY_DATA_DIR = Path.home() / "thesis_project" / "data" 
 
 
-output_file = MY_DATA_DIR / "stations_cleaned.csv"
+output_file = MY_DATA_DIR / "stations.csv"
 
 # Save the cleaned data to a csv file
 stations.to_csv(output_file, index=False)

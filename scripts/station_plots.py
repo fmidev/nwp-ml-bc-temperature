@@ -11,7 +11,7 @@ MAPS_DIR = Path.home() / "thesis_project" / "data" / "maps"
 world = gpd.read_file(MAPS_DIR / "ne_110m_admin_0_countries.shp")
 
 # Load the data
-csv_file = MY_DATA_DIR / "stations_cleaned.csv"
+csv_file = MY_DATA_DIR / "stations.csv"
 
 
 # From MOS wiki the approximate area of the stations 
