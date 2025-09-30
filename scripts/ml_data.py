@@ -79,9 +79,21 @@ def main():
         theta_y = 2 * np.pi * (frac_doy / year_len)
         df["sin_doy"] = np.sin(theta_y)
         df["cos_doy"] = np.cos(theta_y)
+
+        # Remove closed stations and stations that opened late
+        df = df[~df["closed"]]
+        df = df[~df["opened_late"]]
+
+        # Filter to only stations that send observations hourly
+        df = df[df["tag"] == "1h"]
+
+        # Remove duplicate rows
+        df_unique = df.drop_duplicates()
+        rm = len(df) - len(df_unique)
+        print(f"\n Duplicate rows removed {rm}")
     
         # Appendt the merged data frame into the bucket
-        buckets[month_key].append(df)
+        buckets[month_key].append(df_unique)
 
         # Print the bucket, month and the lenght of the data frame to follow the progress 
         print(f"bucketed file={file.name}")
@@ -107,6 +119,9 @@ def main():
         # Write the combined files 
         out_path = OUT / f"ml_data_{month}.parquet"
         final_df.to_parquet(out_path, index=False)
+        print(final_df["SID"].nunique())
+        print(final_df.memory_usage().sum())
+        #print(final_df.head(3))
         print(f"Wrote {out_path} | rows: {len(final_df):,}")
 
 if __name__ == "__main__":

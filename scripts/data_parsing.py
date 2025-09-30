@@ -68,7 +68,7 @@ def main():
     # Filenames/namepatterns
     filename_pattern = "*.parquet"
     filename_obs = "observations.csv"
-    filename_stations = "stations.csv"
+    filename_stations = "stations_with_tags.csv"
 
     # Read the station information from the file 
     df_stations = pd.read_csv(MY_DATA_DIR / filename_stations)

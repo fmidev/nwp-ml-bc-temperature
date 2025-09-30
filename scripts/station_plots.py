@@ -5,7 +5,8 @@ from pathlib import Path
 
 # Paths
 MY_DATA_DIR = Path.home() / "thesis_project" / "data"
-OUT_DIR = Path.home() / "thesis_project" / "figures"
+OUT_DIR = Path.home() / "thesis_project" / "figures" / "station_plots"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAPS_DIR = Path.home() / "thesis_project" / "data" / "maps"
 world = gpd.read_file(MAPS_DIR / "ne_110m_admin_0_countries.shp")
@@ -34,7 +35,7 @@ world.plot(ax = ax, color ="#f2f2f2", edgecolor="#999999", linewidth=0.5)
 # Plot the station points with color based on elevation
 gdf.plot(ax=ax,
          column="elev" if "elev" in gdf.columns else None,
-         cmap="viridis",
+         cmap="viridis_r",
          markersize=18,
          edgecolor="black",
          linewidth=0.3,

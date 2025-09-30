@@ -6,7 +6,8 @@ import numpy as np
 
 # Paths
 MY_DATA_DIR = Path.home() / "thesis_project" / "data"
-OUT = Path.home() / "thesis_project" / "figures" 
+OUT = Path.home() / "thesis_project" / "figures" / "station_plots"
+OUT.mkdir(parents=True, exist_ok=True)
 
 csv_file = MY_DATA_DIR / "observations.csv"
 
@@ -49,6 +50,12 @@ nan_frac = (
       .apply(lambda s: s.isna().mean())
       .rename("nan_fraction")
 )
+
+nan_frac.sort_values().plot(
+    kind="barh", figsize=(8,6), xlabel="Fraction of NaN values", title="NaN fraction per station", fontsize=9
+)
+plt.tight_layout()
+plt.savefig(OUT / "station_nan.png")
 
 # Flag stations that have over 75% NAN values 
 flagged = nan_frac[nan_frac > THRESH].sort_values(ascending=False)
