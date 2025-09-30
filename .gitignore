@@ -7,7 +7,13 @@ data/
 # Ignore generated figures
 figures/
 
-/scripts/ ENSMEAN_check.py
+metrics/
+
+scripts/*.json
+scripts/xgboost_extra.py
+scripts/print_info.py
+scripts/xgboost_train.py
+
 # Byte-compiled / cache files
 __pycache__/
 *.py[cod]
