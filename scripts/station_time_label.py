@@ -81,29 +81,24 @@ def classify_station_from_grid(df, time_col="obstime", value_col="obs_TA", rolli
     return "mixed"
 
 
-def closure_check(df, time_col = "obstime", value_col = "obs_TA", gap_days = 30, reference_date: str | pd.Timestamp | None = "data_max", min_rows_after = 1):
+def closure_check(df, reference_date, time_col = "obstime", value_col = "obs_TA", gap_days = 30):
     """
     Function to check if the station has been closed with the following conditions
     Strict closure:
       closed == True if
         - last_obs exists, and
-        - (ref_date - last_obs) >= gap_days, and
-        - there are >= min_rows_after timestamps AFTER last_obs, and
-        - NONE of those later rows have valid values in value_col.
+        - (ref_date - last_obs) >= gap_days,
+        - None of the rows after last_obs have valid values in value_col.
     Params: 
         df = Dataframe with station information and observations
+        reference_date = The reference date to compare against (last day of values from any station)
         value_col = Name of the observation colums 
         gap_days = Days required to not have observations for closure check
-        reference_date = Reference date; ("data_max" (default), "now", or a pd.Timestamp)
-                            - "data_max" (default): use this group's max timestamp (prevents false closures on historical exports)
-                            - "now": use current UTC time
-                            - pd.Timestamp: a specific cutoff
-                            - None: same as "data_max"
-        min_rows_after = Number of rows required after last observation
     Returns: 
         Boolean: Closed/Not Closed
         Date of closure
     """
+    
     # Check that dataframe is not empty
     if df is None or df.empty:
         # No rows at all -> treat as not enough info to call closed.
@@ -122,59 +117,48 @@ def closure_check(df, time_col = "obstime", value_col = "obs_TA", gap_days = 30,
 
     # Get valid observations
     any_valid = g[value_col].notna()
-
+    
     # Check that there are valid observations
     if any_valid.empty:
         return False, pd.NaT
 
-    # Get last observation timepoint
-    data_max = g[time_col].max()
 
-    # Reference date handling
-    if reference_date is None or reference_date == "data_max":
-        ref_date = data_max
-    elif reference_date == "now":
-        ref_date = pd.Timestamp.utcnow()
-    elif isinstance(reference_date, pd.Timestamp):
-        ref_date = reference_date
-    else:
-        # Fallback to data_max if something odd is passed
-        ref_date = data_max
+    # Reference date
+    ref_date = reference_date
 
     # Last timestamp with any valid value
     last_obs = g.loc[any_valid, time_col].max() if any_valid.any() else pd.NaT
 
     # Rows strictly after the last valid observation
     later = g[g[time_col] > last_obs]
-    has_rows_after = len(later) >= min_rows_after
 
     # Check for any valid observations after 
-    any_valid_after = later[value_col].notna().any() if has_rows_after else False
+    any_valid_after = later[value_col].notna().any()
 
     # Gap relative to reference date
     gap = (pd.Timestamp(ref_date) - last_obs).days
+    long_enough_gap = (gap is not None) and (gap >= gap_days)
 
     # Closed based on the requirements
-    closed = (gap >= gap_days) and has_rows_after and (not any_valid_after)
-
+    closed = (long_enough_gap) and (not any_valid_after)
+    
     # Date of the last observation
     closed_since = last_obs if closed else pd.NaT
 
     return bool(closed), closed_since
 
-def opening_check(df, time_col = "obstime", value_col = "obs_TA", lead_gap_days: int = 30, min_rows_before: int = 1, min_valid_after_rows: int = 24):
+def opening_check(df, reference_date, time_col = "obstime", value_col = "obs_TA", lead_gap_days: int = 30, min_valid_after_rows: int = 24):
     """
     Function to check if a station has been opened after the start of the data period with the following conditions
         Strict opening:
         opened_late == True if
-        - there are rows before the first valid observation (min_rows_before),
         - the span from first timestamp to first valid observation >= lead_gap_days,
         - and there are at least `min_valid_after_rows` valid rows after first valid.
         Params:
             df = Dataframe with station information and observations
+            reference_date = Reference date to compare against (first day of values from any station)
             value_col = Name of the observation colums  
             lead_gap_days = Number of days of 'no data' required before first valid observation to be considered opened late
-            min_rows_before = Number of rows required before the first valid observation
             min_valid_after_rows = Number of rows required after the first valid obsevations to check for sustained observations 
         Returns: 
             Boolean Opened late/Not opened late
@@ -202,31 +186,27 @@ def opening_check(df, time_col = "obstime", value_col = "obs_TA", lead_gap_days:
     if any_valid.empty:
         return False, pd.NaT
 
-    # Get the first timepoint 
-    data_min = g[time_col].min()
+    # Reference date
+    ref_date = pd.Timestamp(reference_date)
 
     # First time we actually had any value
     first_obs = g.loc[any_valid, time_col].min() if any_valid.any() else pd.NaT
-    
-    # Rows strictly BEFORE first valid observation
-    earlier = g[g[time_col] < first_obs]
-    has_rows_before = len(earlier) >= min_rows_before
 
     # Duration of value-less period before first valid
-    lead_gap = (first_obs - data_min).days if pd.notna(data_min) else None
+    lead_gap = (first_obs - ref_date).days
     long_enough_lead_gap = (lead_gap is not None) and (lead_gap >= lead_gap_days)
 
     # After first valid: ensure it's not a single blip
     later = g[g[time_col] >= first_obs]  # include the first valid row
     valid_after_cnt = later[value_col].notna().sum()
 
-    # Check that theree are sustained observations after
+    # Check that there are sustained observations after
     has_sustained_after = valid_after_cnt >= min_valid_after_rows
 
     # Mark station as opened late if requirments are met
-    opened_late = bool(has_rows_before and long_enough_lead_gap and has_sustained_after)
+    opened_late = bool(long_enough_lead_gap and has_sustained_after)
 
-    # Dtae of opening
+    # Date of opening
     opened_since = first_obs if opened_late else pd.NaT
 
     return opened_late, opened_since
@@ -240,6 +220,14 @@ def main():
     # Read observations into a dataframe
     obs = pd.read_csv(OBS_FILE)
 
+    # Parse time once (UTC) and drop obviously bad times
+    obs["obstime"] = pd.to_datetime(obs["obstime"], utc=True, errors="coerce")
+    obs = obs.dropna(subset=["obstime"])
+
+    # Global bounds across ALL stations
+    GLOBAL_START = obs["obstime"].min()
+    GLOBAL_END   = obs["obstime"].max()
+
     # Run through all of the station IDs and group observations by station ID
     results = []
     for sid, group in obs.groupby("SID"):
@@ -248,20 +236,19 @@ def main():
         tag = classify_station_from_grid(group, time_col="obstime", value_col="obs_TA")
 
         # Check if the station has been closed
-        # Strict closure: by default uses this station group's max timestamp as the "end"
-        closed, closed_since = closure_check(group, time_col="obstime", value_col="obs_TA", gap_days=30, reference_date="data_max", min_rows_after=1)
+        closed, closed_since = closure_check(group, reference_date=GLOBAL_END, time_col="obstime", value_col="obs_TA", gap_days=30)
 
         # Check if station was opened late
-        opened, opened_since = opening_check(group, time_col="obstime", value_col="obs_TA", lead_gap_days=30, min_rows_before=1, min_valid_after_rows=24)
-        
+        opened, opened_since = opening_check(group, reference_date=GLOBAL_START, time_col="obstime", value_col="obs_TA", lead_gap_days=30, min_valid_after_rows=24)
+            
         # Append the results for the station 
         results.append({
-        "SID": sid,
-        "tag": tag,
-        "closed": closed,
-        "closed_since": closed_since,
-        "opened_late": opened,
-        "opened_since": opened_since
+            "SID": sid,
+            "tag": tag,
+            "closed": closed,
+            "closed_since": closed_since,
+            "opened_late": opened,
+            "opened_since": opened_since
         })
 
     # Create a dataframe from the results
@@ -271,7 +258,7 @@ def main():
     stations = stations.merge(summary, on="SID", how="left")
 
     # Save the information as a csv file
-    stations.to_csv(OUT / "stations_with_tags.csv", index=False)
+    stations.to_csv(OUT / "stations_with_tags_test.csv", index=False)
     
 if __name__ == "__main__":
     main()
