@@ -22,7 +22,7 @@ warnings.filterwarnings(
 )
 
 # Paths
-PATH = Path.home() / "thesis_project" / "data" / "ml_data" / "ml_data_*.parquet"
+PATH = Path.home() / "thesis_project" / "data" / "ml_data_full" / "ml_data_full_*.parquet"
 LABEL_OBS = "obs_TA"
 TEMP_FC   = "T2"
 OUT = Path.home() / "thesis_project" / "figures"
@@ -41,7 +41,7 @@ TEST_DAYS = 365
 
 # Inside the pre-test period, use K rolling folds
 N_FOLDS = 3
-NUM_BOOST_ROUND = 10000
+NUM_BOOST_ROUND = 20000
 EARLY_STOP = 50
 BIN = 256
 
@@ -49,6 +49,8 @@ BIN = 256
 N_TRIALS = 30      
 TIMEOUT  = None    # (seconds) or keep None
 RANDOM_SEED = 42
+
+USE_WEIGHTS = True
 
 
 def load_dataset():
@@ -211,10 +213,11 @@ def make_objective_with_cold_weights(raw_folds):
         # XGBoost params for the trial
         params = make_params(trial)
 
-        # Weight hyperparameters to optimize
-        threshold_K = trial.suggest_float("w_threshold_K", 255.0, 268.0)   # ~ -18°C..-5°C
-        alpha       = trial.suggest_float("w_alpha", 0.02, 0.5, log=True)
-        max_w       = trial.suggest_float("w_max_w", 3.0, 30.0)
+        if USE_WEIGHTS:
+            # Weight hyperparameters to optimize
+            threshold_K = trial.suggest_float("w_threshold_K", 255.0, 268.0)   # ~ -18°C..-5°C
+            alpha       = trial.suggest_float("w_alpha", 0.02, 0.5, log=True)
+            max_w       = trial.suggest_float("w_max_w", 3.0, 30.0)
 
         scores = []
         pruning_cb = optuna.integration.XGBoostPruningCallback(trial, "val-rmse")
@@ -222,13 +225,19 @@ def make_objective_with_cold_weights(raw_folds):
         # Loop through the folds
         for (df_tr, X_tr, y_tr, df_va, X_va, y_va) in raw_folds:
 
-            # Build weights for THIS trial 
-            w_tr = make_weights_by_cold_params(df_tr, threshold_K, alpha, max_w)
-            w_va = make_weights_by_cold_params(df_va, threshold_K, alpha, max_w)
+            if USE_WEIGHTS:
+                # Build weights for THIS trial 
+                w_tr = make_weights_by_cold_params(df_tr, threshold_K, alpha, max_w)
+                w_va = make_weights_by_cold_params(df_va, threshold_K, alpha, max_w)
 
-            # Build the QuantileDMatrices for the train and validation fold 
-            dtrain = xgb.QuantileDMatrix(X_tr, y_tr, weight=w_tr, max_bin=256)
-            dval   = xgb.QuantileDMatrix(X_va, y_va, weight=w_va, ref=dtrain)
+                # Build the QuantileDMatrices for the train and validation fold 
+                dtrain = xgb.QuantileDMatrix(X_tr, y_tr, weight=w_tr, max_bin=256)
+                dval   = xgb.QuantileDMatrix(X_va, y_va, weight=w_va, ref=dtrain)
+
+            else:
+                 # Unweighted DMatrices
+                dtrain = xgb.QuantileDMatrix(X_tr, y_tr, max_bin=params.get("max_bin", 256))
+                dval   = xgb.QuantileDMatrix(X_va, y_va, ref=dtrain)
 
             # Train the XGBoost model
             bst = xgb.train(
@@ -296,14 +305,6 @@ def main():
     # Get the best parameters
     best_params = dict(study.best_trial.params)
 
-    # Get the best weight parameters
-    thrK = best_params.pop("w_threshold_K")                            
-    a    = best_params.pop("w_alpha")                                     
-    mw   = best_params.pop("w_max_w")                                      
-
-    # Get weights for the full (train/validation) data
-    w_full = make_weights_by_cold_params(df_full, thrK, a, mw)              
-
     # XGBoost parameters as before
     best_params.update({
         "objective": "reg:squarederror",
@@ -314,8 +315,31 @@ def main():
     })
     best_params["max_bin"] = best_params.get("max_bin", 256)
 
-    # Build the QuantileDMAtrix and train the model
-    dfull = xgb.QuantileDMatrix(X_full, y_full, weight=w_full, max_bin=256)
+    if USE_WEIGHTS:
+        # Get the best weight parameters
+        thrK = best_params.pop("w_threshold_K")                            
+        a    = best_params.pop("w_alpha")                                     
+        mw   = best_params.pop("w_max_w")  
+
+        weight_hparams = {
+        "w_threshold_K": best_params.pop("w_threshold_K"),
+        "w_alpha":       best_params.pop("w_alpha"),
+        "w_max_w":       best_params.pop("w_max_w"),}  
+
+        with open("weight_hparams.json", "w") as f:
+            json.dump(weight_hparams, f, indent=4)                                  
+
+        # Get weights for the full (train/validation) data
+        w_full = make_weights_by_cold_params(df_full, thrK, a, mw)  
+            # Build the QuantileDMAtrix and train the model
+        dfull = xgb.QuantileDMatrix(X_full, y_full, weight=w_full, max_bin=256)      
+
+    else: 
+        dfull = xgb.QuantileDMatrix(X_full, y_full, max_bin=256)
+
+    with open("best_params_full_w.json", "w") as f:
+        json.dump(best_params, f, indent=4)
+
     bst = xgb.train(
         best_params,
         dfull,
@@ -328,7 +352,7 @@ def main():
     print("Refit best_iteration:", bst.best_iteration, "| best_score:", bst.best_score)
 
     # Save model
-    bst.save_model("bias_model_tuned_weighted_best.json")
+    bst.save_model("bias_model_tuned_w_best_full.json")
 
     # Quick test-year report (bias RMSE)
     X_test, y_test = to_xy_bias(df_test)
@@ -340,10 +364,10 @@ def main():
     from optuna.visualization.matplotlib import plot_param_importances, plot_optimization_history
 
     fig1 = plot_param_importances(study)
-    fig1.figure.savefig(OUT / "param_importances.png", dpi=200, bbox_inches="tight")
+    fig1.figure.savefig(OUT / "param_importances_tuned_w_full.png", dpi=200, bbox_inches="tight")
 
     fig2 = plot_optimization_history(study)
-    fig2.figure.savefig(OUT / "optimization_history.png", dpi=200, bbox_inches="tight")
+    fig2.figure.savefig(OUT / "optimization_history_tuned_w_full.png", dpi=200, bbox_inches="tight")
 
 if __name__ == "__main__":
     main() 
