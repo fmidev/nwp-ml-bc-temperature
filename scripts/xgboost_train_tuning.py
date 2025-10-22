@@ -10,6 +10,7 @@ import xgboost as xgb
 import optuna
 import optuna.visualization as vis
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
 
 # Silence specific warning 
@@ -33,15 +34,16 @@ weather = [
     "MSL", TEMP_FC, "D2", "U10", "V10", "LCC", "MCC", "SKT",
     "MX2T", "MN2T", "T_925", "T2_ENSMEAN_MA1", "T2_M1", "T_925_M1"
 ]
-meta = ["leadtime", "lon", "lat", "elev", "sin_hod", "cos_hod", "sin_doy", "cos_doy"]
+meta = ["leadtime", "lon", "lat", "elev", "sin_hod", "cos_hod", "sin_doy", "cos_doy", "analysishour"]
 FEATS = weather + meta
 
 # Hold out the last ~1y as final TEST
 TEST_DAYS = 365
+TRAIN_START_DT = datetime(2019, 1, 1)
 
 # Inside the pre-test period, use K rolling folds
 N_FOLDS = 3
-NUM_BOOST_ROUND = 20000
+NUM_BOOST_ROUND = 10000
 EARLY_STOP = 50
 BIN = 256
 
@@ -50,7 +52,7 @@ N_TRIALS = 30
 TIMEOUT  = None    # (seconds) or keep None
 RANDOM_SEED = 42
 
-USE_WEIGHTS = True
+USE_WEIGHTS = False
 
 
 def load_dataset():
@@ -69,6 +71,9 @@ def load_dataset():
     lf = lf.with_columns(
         pl.col("analysistime").str.strptime(pl.Datetime, strict=False).alias("analysistime_dt")
     )
+
+    # Change analysishour to integer
+    lf = lf.with_columns(pl.col("analysishour").cast(pl.Int8))
 
     # Filter out the rows with missing temperature values
     df = (
@@ -96,51 +101,38 @@ def to_xy_bias(df_pl):
     return X, y
 
 def split_trainval_test(df):
-    """
-    Function to split the dataset into train, validation and test sets
-        Params: 
-            df = Dataframe of the dataset
-        Returns: 
-            folds = Data folds for the train and validation
-            df_test = Dataset for the testing """
 
-    # Split last ~year as test set
-    # Max analysistime (last analysistime)
+    # Last ~year as test set
     max_at = df["analysistime_dt"].max()
-
-    # Get the start data for test set based on the number of test days wanted
     test_start = max_at - timedelta(days=TEST_DAYS)
 
-    # Split the dataset into Train+Validation and Test sets 
-    df_tv = df.filter(pl.col("analysistime_dt") < test_start)
+    # Train+Val before test, then restrict to >= 2019-01-01
+    df_tv = df.filter(
+        (pl.col("analysistime_dt") < test_start) &
+        (pl.col("analysistime_dt") >= TRAIN_START_DT)
+    )
     df_test = df.filter(pl.col("analysistime_dt") >= test_start)
 
-    # Rolling folds on df_tv (Train and Validation sets)
-    inits = (df_tv.select("analysistime_dt").unique().sort("analysistime_dt")["analysistime_dt"].to_list())
+    # Rolling folds on restricted df_tv
+    inits = (df_tv.select("analysistime_dt")
+                  .unique()
+                  .sort("analysistime_dt")["analysistime_dt"].to_list())
     if len(inits) < N_FOLDS + 1:
-        raise ValueError("Not enough initializations for requested N_FOLDS.")
+        raise ValueError("Not enough initializations for requested N_FOLDS after applying TRAIN_START_DT.")
 
-    # Create N_FOLDS folds: each fold uses everything up to a cutoff as train,
-    # and the next chunk as validation. Rough equal splits by time.
     fold_edges = [int(round(i*len(inits)/(N_FOLDS+1))) for i in range(1, N_FOLDS+1)]
     folds = []
-    prev_edge = 0
-    for edge in fold_edges:
+    for i, edge in enumerate(fold_edges, start=1):
         val_start = inits[edge-1]
-        train_mask = df_tv["analysistime_dt"] <  val_start
-        val_mask   = df_tv["analysistime_dt"] >= val_start
-        # keep validation reasonably sized: cap to next segment
         next_edge = min(edge + (fold_edges[1]-fold_edges[0] if len(fold_edges)>1 else edge), len(inits))
+        val_mask = pl.col("analysistime_dt") >= val_start
         if next_edge > edge:
             val_end = inits[next_edge-1]
-            val_mask = (df_tv["analysistime_dt"] >= val_start) & (df_tv["analysistime_dt"] <= val_end)
-
-        df_tr = df_tv.filter(train_mask)
+            val_mask = (pl.col("analysistime_dt") >= val_start) & (pl.col("analysistime_dt") <= val_end)
+        df_tr = df_tv.filter(pl.col("analysistime_dt") < val_start)
         df_va = df_tv.filter(val_mask)
-        if len(df_tr) == 0 or len(df_va) == 0:
-            continue
-        folds.append((df_tr, df_va))
-        prev_edge = edge
+        if len(df_tr) and len(df_va):
+            folds.append((df_tr, df_va))
 
     return folds, df_test
 
@@ -322,9 +314,9 @@ def main():
         mw   = best_params.pop("w_max_w")  
 
         weight_hparams = {
-        "w_threshold_K": best_params.pop("w_threshold_K"),
-        "w_alpha":       best_params.pop("w_alpha"),
-        "w_max_w":       best_params.pop("w_max_w"),}  
+        "w_threshold_K": thrK,
+        "w_alpha":       a,
+        "w_max_w":       mw,}  
 
         with open("weight_hparams.json", "w") as f:
             json.dump(weight_hparams, f, indent=4)                                  
@@ -337,7 +329,7 @@ def main():
     else: 
         dfull = xgb.QuantileDMatrix(X_full, y_full, max_bin=256)
 
-    with open("best_params_full_w.json", "w") as f:
+    with open("best_params_2019_ah.json", "w") as f:
         json.dump(best_params, f, indent=4)
 
     bst = xgb.train(
@@ -346,13 +338,13 @@ def main():
         num_boost_round=NUM_BOOST_ROUND,
         evals=[(dfull, "full")],
         early_stopping_rounds=EARLY_STOP,
-        verbose_eval=50,
+        verbose_eval=100,
     )
 
     print("Refit best_iteration:", bst.best_iteration, "| best_score:", bst.best_score)
 
     # Save model
-    bst.save_model("bias_model_tuned_w_best_full.json")
+    bst.save_model("bias_model_tuned_ah_best_2019.json")
 
     # Quick test-year report (bias RMSE)
     X_test, y_test = to_xy_bias(df_test)
@@ -364,10 +356,10 @@ def main():
     from optuna.visualization.matplotlib import plot_param_importances, plot_optimization_history
 
     fig1 = plot_param_importances(study)
-    fig1.figure.savefig(OUT / "param_importances_tuned_w_full.png", dpi=200, bbox_inches="tight")
+    fig1.figure.savefig(OUT / "param_importances_tuned_ah_2019.png", dpi=200, bbox_inches="tight")
 
     fig2 = plot_optimization_history(study)
-    fig2.figure.savefig(OUT / "optimization_history_tuned_w_full.png", dpi=200, bbox_inches="tight")
+    fig2.figure.savefig(OUT / "optimization_history_tuned_ah_2019.png", dpi=200, bbox_inches="tight")
 
 if __name__ == "__main__":
     main() 

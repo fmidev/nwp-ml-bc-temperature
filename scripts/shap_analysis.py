@@ -8,15 +8,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Paths 
-DATA_PATH   = Path.home() / "thesis_project" / "data" / "ml_data" / "ml_data_*.parquet"
-MODEL_PATH  = "bias_model_tuned_weighted_best.json"
+DATA_PATH   = Path.home() / "thesis_project" / "data" / "ml_data_full" / "ml_data_full_*.parquet"
+MODEL_PATH  = "bias_model_tuned_ah_best_2019.json"
 #FEATS_PATH  = "bias_model_features.json"   # <- save your FEATS at train time (see note below)
 OUT = Path.home() / "thesis_project" / "figures" / "SHAP"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # If you didn’t save features to json, define them here (order must match training):
 weather = ["MSL","T2","D2","U10","V10","LCC","MCC","SKT","MX2T","MN2T","T_925","T2_ENSMEAN_MA1","T2_M1","T_925_M1"]
-meta    = ["leadtime","lon","lat","elev","sin_hod","cos_hod","sin_doy","cos_doy"]
+meta    = ["leadtime","lon","lat","elev","sin_hod","cos_hod","sin_doy","cos_doy", "analysishour"]
 FEATS   = weather + meta
 
 # How many samples to explain (SHAP is O(n_features * n_trees))
@@ -50,6 +50,8 @@ lf = lf.with_columns(
     pl.col("analysistime").str.strptime(pl.Datetime, strict=False).alias("analysistime_dt")
 )
 
+lf = lf.with_columns(pl.col("analysishour").cast(pl.Int8))
+
 df = lf.collect(engine="streaming")
 if HOLDOUT_DAYS:
     import datetime as dt
@@ -61,6 +63,8 @@ dfX = df.select(FEATS)
 
 # Convert to numpy (float32)
 X_all = dfX.to_numpy().astype(np.float32, copy=False)
+
+
 
 # SAMPLE to keep SHAP fast and memory-safe
 n = X_all.shape[0]
@@ -88,19 +92,22 @@ except Exception:
 # (n_samples, n_features)
 print("SHAP matrix shape:", shap_values.shape)  
 
+max_display = len(FEATS)
+
+
 # Plots
 # 1) Beeswarm summary (global importance + direction)
 plt.figure()
-shap.summary_plot(shap_values, X_sample, feature_names=FEATS, show=False)
+shap.summary_plot(shap_values, X_sample, feature_names=FEATS, show=False, max_display=max_display)
 plt.tight_layout()
-plt.savefig(OUT / "beeswarm.png")
+plt.savefig(OUT / "beeswarm_2019.png")
 plt.close()
 
 # 2) Bar plot (mean(|SHAP|) ranking)
 plt.figure()
-shap.summary_plot(shap_values, X_sample, feature_names=FEATS, plot_type="bar", show=False)
+shap.summary_plot(shap_values, X_sample, feature_names=FEATS, plot_type="bar", show=False, max_display=max_display)
 plt.tight_layout()
-plt.savefig(OUT / "shap_bar.png")
+plt.savefig(OUT / "shap_bar_2019.png")
 plt.close()
 
 # 3) Dependence plots (pick a couple of key features)
@@ -111,4 +118,4 @@ for feat in ["leadtime", "T2"]:
             feat, shap_values, X_sample, feature_names=FEATS, interaction_index=None, show=False
         )
         plt.tight_layout()
-        plt.savefig(OUT / f"dependece_{feat}.png")
+        plt.savefig(OUT / f"dependece_{feat}_2019.png")
