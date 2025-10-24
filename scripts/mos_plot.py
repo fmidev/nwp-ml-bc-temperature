@@ -20,6 +20,7 @@ FIG_DPI   = 150
 
 # Paths
 HOME     = Path.home()
+STATION_FILE = HOME / "thesis_project" / "data" / "stations.csv"
 METRICS  = HOME / "thesis_project" / "metrics"
 MOS_DIR  = METRICS / "mos"
 ML_DIR   = METRICS / "full_tuned_ah"                            
@@ -37,6 +38,18 @@ MLCOL = f"corrected_{ML_TAG}"
 # -------------------------------
 # Helpers
 # -------------------------------
+
+def load_station_names(station_file=STATION_FILE, sid_col="SID", name_col="name"):
+    """ Helper function to load stations names from csv file
+        Params:
+            station_file = Path and file name of the csv file containing the station information
+            sid_col = Name of the station ID column
+            name_col = Name of the station name column
+        Returns: Dictionary of the station IDs and names"""
+    stations = pd.read_csv(station_file, dtype={sid_col: str})
+    return dict(zip(stations[sid_col].astype(str), stations[name_col]))
+
+
 def rmse(a, b):
     """Calculate the rmse for two sets of temperatures"""
     a = np.asarray(a, float) 
@@ -102,7 +115,7 @@ def leadtime_coverage(df, name):
     """Print the leadtime coverage for the model"""
     print(f"[COV] {name}: rows={df.height}, unique leadtimes={df.select(pl.col('leadtime').n_unique()).item()}")
 
-def plot(df: pd.DataFrame, target_station: str, target_init: str):
+def plot(df: pd.DataFrame, target_station: str, target_init: str, station_name: str):
     """Plot the temperature values for the models and observations for the chosen station and analysistime
         Params:
             df = Dataframe with the temperature values
@@ -136,7 +149,7 @@ def plot(df: pd.DataFrame, target_station: str, target_init: str):
                     s=25, marker="o", color="black", label="Observation")
 
     # Plot parameters
-    plt.title(f"Station {target_station} — Init {target_init}")
+    plt.title(f"{station_name} {target_station} — Init {target_init}")
     plt.xlabel("Valid time")
     plt.ylabel("Temperature (K)")
     plt.grid(True, alpha=0.3)
@@ -169,6 +182,8 @@ def main():
     # List of wanted analysistimes (string)
     inits = ["2025-01-01 00:00:00"]
 
+    station_names = load_station_names()
+
     # Load data from MOS and ML model
     mos_plot = load_eval_rows_evaldir(MOS_DIR, f"eval_rows_{SPLIT}_MOS_*.parquet", MOS)
     ml_plot = load_eval_rows_evaldir(ML_DIR, f"eval_rows_{SPLIT}_{ML_TAG}_20*.parquet", MLCOL)
@@ -177,6 +192,7 @@ def main():
     for target_station in stations:
         for target_init in inits:
 
+            station_name = station_names.get(str(target_station))
             # Filter for the certain station and analysistime
             mos_plot = filter_for_station_init(mos_plot, target_station, target_init, MOS)
             ml_plot = filter_for_station_init(ml_plot, target_station, target_init, MLCOL)
@@ -225,7 +241,7 @@ def main():
             print(f"[INFO] Columns present: {sorted(plot_pd.columns)}")
 
             # Make the figure
-            plot(plot_pd, target_station, target_init)
+            plot(plot_pd, target_station, target_init, station_name)
 
 if __name__ == "__main__":
     main()
