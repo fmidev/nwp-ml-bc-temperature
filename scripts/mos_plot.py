@@ -6,8 +6,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-
-
 # Your ML model tag used when saving eval rows (=> column "corrected_<ML_TAG>")
 ML_TAG = "tuned_ah_full" 
 # Name of the model for the plot  
@@ -60,6 +58,10 @@ def rmse(a, b):
     d = a[m] - b[m]
     return float(np.sqrt(np.mean(d*d)))
 
+
+# ------------------------------------------
+# Data loading and preparation functions
+# ------------------------------------------
 
 def load_eval_rows_evaldir(eval_dir: Path, pattern: str, tag: str):
     """Load the data
@@ -115,6 +117,10 @@ def leadtime_coverage(df, name):
     """Print the leadtime coverage for the model"""
     print(f"[COV] {name}: rows={df.height}, unique leadtimes={df.select(pl.col('leadtime').n_unique()).item()}")
 
+
+# ----------------------
+# Plot function
+#-----------------------
 def plot(df: pd.DataFrame, target_station: str, target_init: str, station_name: str):
     """Plot the temperature values for the models and observations for the chosen station and analysistime
         Params:
