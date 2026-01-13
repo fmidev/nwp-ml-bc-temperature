@@ -11,13 +11,13 @@ os.environ["MKL_NUM_THREADS"] = "16"
 # Paths
 HOME = Path.home()
 DATA_GLOB = HOME / "thesis_project" / "data" / "ml_data_full" 
-MODEL_PATH = "bias_model_tuned_ah_best_2019.json"
-MODEL_TAG = "tuned_ah_2019"
+MODEL_PATH = "bias_model_tuned_full_new.json"
+MODEL_TAG = "tuned_full"
 
-OUTDIR = HOME / "thesis_project" / "metrics" / "2019_tuned_ah"
+OUTDIR = HOME / "thesis_project" / "metrics" / "tuned_full_new"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-SPLIT_COLUMN = "analysistime"  # or "validtime"
+SPLIT_COLUMN = "validtime"  # or "validtime"
 
 # Features and label
 TEMP_FC   = "T2"
@@ -80,7 +80,7 @@ def safe_month(col):
 
 def main():
         
-    for year in range(2019, 2026):
+    for year in range(2024, 2026):
         print(f"Processing year {year}...")
         
         files = sorted(DATA_GLOB.glob(f"ml_data_full_{year}-*.parquet"))
