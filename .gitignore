@@ -9,6 +9,8 @@ figures/
 
 metrics/
 
+models/
+
 scripts/*.json
 scripts/xgboost_extra.py
 scripts/print_info.py
