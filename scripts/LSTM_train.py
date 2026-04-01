@@ -27,6 +27,8 @@ import time
 from datetime import datetime
 import torch.multiprocessing as mp
 
+import threading, queue
+
 
 
 # -------------------------
@@ -53,9 +55,9 @@ LABEL_OBS = "obs_TA"
 TEMP_FC   = "T2"
 STATION_ID_COL = "SID"
 
-SEQ_LEN = 48
+#SEQ_LEN = 5
 BATCH_SIZE = 16384          # use your VRAM
-MAX_EPOCHS = 50
+MAX_EPOCHS = 200
 PATIENCE = 8
 MIN_DELTA = 1e-4
 LR = 3e-4
@@ -69,10 +71,11 @@ N_TRIALS = 30
 
 # For IterableDataset we must cap work per trial, otherwise each "epoch" is huge.
 TRIAL_STEPS_PER_EPOCH = 200   # e.g. 200–2000
-TRIAL_MAX_EPOCHS = 10       # per trial
+TRIAL_MAX_EPOCHS = 50       # per trial
 TRIAL_PATIENCE = 3            # per trial early stopping
 
-
+FINAL_STEPS_PER_EPOCH = 1000 
+FINAL_VAL_STEPS       = 500
 
 TEST_DAYS = 365
 VAL_DAYS_FINAL = 90
@@ -83,14 +86,18 @@ N_FOLDS = 3
 STATS_SAMPLE_PER_FILE = 20_000
 
 # Loader tuning (effective only after prepare step)
-NUM_WORKERS = 1
-PREFETCH_FACTOR = 2
+NUM_WORKERS_OPTUNA = 0
+PREFETCH_FINAL = 2
+NUM_WORKERS_FINAL = 4
 
 # Artifacts for inference
 MODEL_DIR = HOME / "thesis_project" / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_PATH = MODEL_DIR / "bias_lstm_stream.pt"
 STATS_PATH = MODEL_DIR / "bias_lstm_stream_stats.json"
+
+MAX_LEAD_HOURS = 240
+EMBARGO_TD = timedelta(hours=MAX_LEAD_HOURS)
 
 
 import torch.multiprocessing as mp
@@ -108,12 +115,11 @@ def _set_mp_spawn():
 # Utilities
 # -------------------------
 
-def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3, train_start_dt=None):
+def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3, train_start_dt=None, embargo_td = EMBARGO_TD):
     """
-    Same logic as XGB/GNN:
-      - test_start = max(validtime_dt) - test_days
-      - TV = [min..test_start) or [train_start_dt..test_start)
-      - rolling folds inside TV using unique sorted validtime_dt
+        -Splits made using analysistime instead of validtime like in XGB/GNN to keep full forecasts intact
+        - train_end = val_start - embargo_td
+        -Added embargo_td to not leak information into the next fold
     Returns:
       folds = list of (train_end, val_start, val_end) as datetimes
       test_start
@@ -123,27 +129,29 @@ def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3,
     _, vt_max = get_global_minmax_validtime(prep_files)
     test_start = vt_max - timedelta(days=test_days)
 
-    # Gather unique validtime_dt in TV window (streaming per file)
+    latest_val_init = test_start - embargo_td
+
+    # Gather unique analysistime_dt in TV window (streaming per file)
     chunks = []
     for fp in prep_files:
-        lf = pl.scan_parquet(fp).select("validtime_dt")
+        lf = pl.scan_parquet(fp).select("analysistime_dt")
 
         if train_start_dt is None:
-            lf = lf.filter(pl.col("validtime_dt") < test_start)
+            lf = lf.filter(pl.col("analysistime_dt") < latest_val_init)
         else:
-            lf = lf.filter((pl.col("validtime_dt") < test_start) & (pl.col("validtime_dt") >= train_start_dt))
+            lf = lf.filter((pl.col("analysistime_dt") < latest_val_init) & (pl.col("analysistime_dt") >= train_start_dt))
 
         df = lf.unique().collect(engine="streaming")
         if df.height:
             chunks.append(df)
 
     if not chunks:
-        raise RuntimeError("No validtime_dt found for train/val period.")
+        raise RuntimeError("No analysistime_dt found for train/val period.")
 
     inits = (
         pl.concat(chunks, how="vertical_relaxed")
           .unique()
-          .sort("validtime_dt")["validtime_dt"]
+          .sort("analysistime_dt")["analysistime_dt"]
           .to_list()
     )
 
@@ -151,41 +159,62 @@ def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3,
         raise ValueError("Not enough initializations for requested N_FOLDS after applying TRAIN_START_DT.")
 
     fold_edges = [int(round(i * len(inits) / (n_folds + 1))) for i in range(1, n_folds + 1)]
+    step = (fold_edges[1] - fold_edges[0]) if len(fold_edges) > 1 else fold_edges[0]
 
     folds = []
-    for i, edge in enumerate(fold_edges, start=1):
+    for edge in fold_edges:
         val_start = inits[edge - 1]
 
-        next_edge = min(
-            edge + (fold_edges[1] - fold_edges[0] if len(fold_edges) > 1 else edge),
-            len(inits)
-        )
-
-        # SAME as XGB code: if next_edge > edge, define a bounded val_end
+        next_edge = min(edge + step, len(inits))
         if next_edge > edge:
             val_end = inits[next_edge - 1]
         else:
             val_end = inits[-1]
 
-        # Train_end is just val_start (train is everything < val_start)
-        train_end = val_start
+        train_end = val_start - embargo_td
+
+        if train_start_dt is not None and train_end <= train_start_dt:
+            continue
+        if train_end >= val_start:
+            continue
+
         folds.append((train_end, val_start, val_end))
+
+    if not folds:
+        raise ValueError("No valid folds left after applying embargo.")
 
     return folds, test_start
 
 
-def split_final_train_val_test_from_max(prep_files, test_days=365, val_days=90, train_start_dt=None):
+def split_final_train_val_test_from_max(
+    prep_files,
+    test_days=365,
+    val_days=90,
+    train_start_dt=None,
+    embargo_td=EMBARGO_TD,
+):
     """
-    Same as 'split_final_train_val' idea:
-      test_start = max - test_days
-      val_start  = test_start - val_days
+    Final split with embargo between validation and test.
+
+    Returns:
+      val_start, val_end, test_start
+
+      train: analysistime_dt < val_start
+      val:   analysistime_dt >= val_start and analysistime_dt < val_end
+      test:  analysistime_dt >= test_start
+
+      embargo region [val_end, test_start) is dropped.
     """
     _, vt_max = get_global_minmax_validtime(prep_files)
     test_start = vt_max - timedelta(days=test_days)
-    val_start  = test_start - timedelta(days=val_days)
 
-    # If you want a hard train start date, apply it later in dataset time_min
-    return val_start, test_start
+    val_end = test_start - embargo_td
+    val_start = val_end - timedelta(days=val_days)
+
+    if train_start_dt is not None and val_start <= train_start_dt:
+        raise ValueError("Validation window too early after applying embargo.")
+
+    return val_start, val_end, test_start
 
 
 
@@ -274,6 +303,35 @@ def add_dt_hours(df: pl.DataFrame) -> pl.DataFrame:
           )
     )
 
+def add_dt_valid_hours(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add a `dt_valid_hours` column containing the time difference in hours
+    between consecutive `validtime_dt` values within each station and
+    `analysistime_dt` group.
+
+    The input is first sorted by station, analysis time, and valid time so
+    that differences are calculated in chronological order. The first row in
+    each group gets 0.0, and all values are clipped to the range [0, 30 days].
+    """
+    return (
+        df.sort([STATION_ID_COL, "analysistime_dt", "validtime_dt"])
+          .with_columns(
+              (
+                  # Compute the difference between consecutive valid times
+                  # for each (station, analysistime) group.
+                  pl.col("validtime_dt")
+                    .diff()
+                    .over([STATION_ID_COL, "analysistime_dt"])
+                    .dt.total_hours()
+                    # The first row in each group has no previous value,
+                    # so replace null with 0.0 hours.
+                    .fill_null(0.0)
+                    .clip(0.0, 24.0 * 30.0)
+                    .alias("dt_valid_hours")
+              )
+          )
+    )
+
 
 def get_global_minmax_validtime(files):
     """
@@ -324,7 +382,7 @@ def prepare_files_once(raw_files):
       - select needed columns
       - ensure *_dt exist
       - dedup + dt_hours
-      - sort by (SID, validtime_dt)
+      - sort by (SID, analysistime_dt, validtime_dt)
     Output: PREP_DIR/ml_data_prep_*.parquet
     """
     needed = [STATION_ID_COL, "validtime_dt", "analysistime_dt", *FEATS, LABEL_OBS]
@@ -337,11 +395,16 @@ def prepare_files_once(raw_files):
         if df.height == 0:
             continue
 
-        df = add_dt_hours(dedup_per_station_validtime(df))
+        """df = add_dt_hours(dedup_per_station_validtime(df))
+        if df.height == 0:
+            continue"""
+
+        df = df.sort([STATION_ID_COL, "analysistime_dt", "validtime_dt"])
+
+        df= add_dt_valid_hours(df)
         if df.height == 0:
             continue
 
-        df = df.sort([STATION_ID_COL, "validtime_dt"])
         df.write_parquet(out)
         print("Wrote", out)
 
@@ -381,7 +444,7 @@ def fit_stats_strict_train(prep_files, feats, time_max, sample_per_file, seed):
     for fp in prep_files:
         lf = (
             pl.scan_parquet(fp)
-              .filter(pl.col("validtime_dt") < time_max)
+              .filter(pl.col("analysistime_dt") < time_max)
               .select(feats)
               .head(sample_per_file * 5)
         )
@@ -482,7 +545,7 @@ class PrepStreamSeqDataset(IterableDataset):
             X[:, k + 1] = miss.astype(np.float32)
             k += 2
 
-        dt = df["dt_hours"].to_numpy()
+        dt = df["dt_valid_hours"].to_numpy()
         dt = np.nan_to_num(dt, nan=0.0).astype(np.float32, copy=False)
         X[:, -1] = dt
         return X
@@ -528,7 +591,7 @@ class PrepStreamSeqDataset(IterableDataset):
             so it becomes available for future targets.
 
         Notes:
-        - Assumes PREP files are already sorted by (sid, validtime_dt); the optional sort
+        - Assumes PREP files are already sorted by (sid, analysistime_dt, validtime_dt); the optional sort
             is kept commented out as a safety fallback.
         - The model never “sees” the current timestep features when predicting y[i];
             it only uses prior history (causal setup).
@@ -546,7 +609,7 @@ class PrepStreamSeqDataset(IterableDataset):
         for fp in files:
             lf = (
                 pl.scan_parquet(fp)
-                .select([self.sid_col, "validtime_dt", "dt_hours", *self.feats, self.label_obs])
+                .select([self.sid_col, "analysistime_dt", "validtime_dt", "dt_valid_hours", *self.feats, self.label_obs])
                 .filter((pl.col("validtime_dt") >= self.time_min) & (pl.col("validtime_dt") < self.time_max))
                 .filter(pl.col(self.label_obs).is_not_null() & pl.col(self.temp_fc).is_not_null())
             )
@@ -556,15 +619,18 @@ class PrepStreamSeqDataset(IterableDataset):
                 continue
 
             # Already sorted in prep, but keep safe
-            # df = df.sort([self.sid_col, "validtime_dt"])
+            # df = df.sort([self.sid_col, "analysistime_dt", "validtime_dt"])
 
             X_block = self._transform_block(df)
             sid = df[self.sid_col].to_numpy()
+            #at_ns = df["analysistime_ns"].to_numpy()
+            at = df["analysistime_dt"].to_list()
             y = (df[self.label_obs] - df[self.temp_fc]).to_numpy().astype(np.float32)
 
             for i in range(df.height):
-                s = sid[i]
-                hist = buf[s]
+                # To only use the current forecast to correct that forecast
+                key = (int(sid[i]), at[i])
+                hist = buf[key]
 
                 if len(hist) >= 1:
                     hist_arr = np.stack(hist, axis=0)
@@ -604,6 +670,42 @@ def collate_batch(batch):
     X, y, m = zip(*batch)
     return torch.stack(X, 0), torch.stack(y, 0), torch.stack(m, 0)
 
+
+class ThreadPrefetcher:
+    """
+    Wrap an iterable loader and prefetch items in a background thread.
+
+    Items from `loader` are read asynchronously and stored in a bounded
+    queue so the consumer can retrieve already-prepared batches while the
+    next ones are being loaded.
+
+    Args:
+        loader: Iterable producing batches.
+        max_prefetch: Maximum number of prefetched batches to buffer.
+    """
+    def __init__(self, loader, max_prefetch=8):
+        self.loader = loader
+        self.q = queue.Queue(maxsize=max_prefetch)
+        self._stop = object()
+
+    def __iter__(self):
+        it = iter(self.loader)
+
+        def _worker():
+            try:
+                for batch in it:
+                    self.q.put(batch)
+            finally:
+                self.q.put(self._stop)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        while True:
+            batch = self.q.get()
+            if batch is self._stop:
+                break
+            yield batch
 
 # -------------------------
 # Model
@@ -836,24 +938,25 @@ def objective_cv(trial, prep_files, folds, mu, sd, ctx):
           mean(best_val_fold_0, best_val_fold_1, ...)
       - Optuna will try to minimize this returned float.
     """
-    hidden     = trial.suggest_categorical("hidden", [64, 96, 128, 160, 192, 256])
-    num_layers = trial.suggest_int("num_layers", 1, 3)
+    hidden     = trial.suggest_categorical("hidden", [160, 192, 256])
+    num_layers = trial.suggest_int("num_layers", 1, 1)
     dropout    = trial.suggest_float("dropout", 0.0, 0.4)
     lr         = trial.suggest_float("lr", 5e-5, 1e-3, log=True)
-    wd         = trial.suggest_float("wd", 1e-7, 5e-3, log=True)
+    wd         = trial.suggest_float("wd", 1e-6, 5e-3, log=True)
     grad_clip  = trial.suggest_float("grad_clip", 0.5, 5.0)
+    seq_len = trial.suggest_int("seq_len", 5, 24)
 
     in_dim = 2 * len(FEATS) + 1
     fold_bests = []
     global_step = 0
 
-    for fold_id, (_train_end, val_start, val_end) in enumerate(folds):
+    for fold_id, (train_end, val_start, val_end) in enumerate(folds):
         ds_tr = PrepStreamSeqDataset(
             files=prep_files,
             time_min=pl.datetime(1900, 1, 1),
-            time_max=val_start,
+            time_max=train_end,
             feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=SEQ_LEN,
+            sid_col=STATION_ID_COL, seq_len=seq_len,
             mu=mu, sd=sd,
         )
         ds_va = PrepStreamSeqDataset(
@@ -861,26 +964,29 @@ def objective_cv(trial, prep_files, folds, mu, sd, ctx):
             time_min=val_start,
             time_max=val_end,
             feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=SEQ_LEN,
+            sid_col=STATION_ID_COL, seq_len=seq_len,
             mu=mu, sd=sd,
         )
 
         dl_tr = DataLoader(
             ds_tr, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, collate_fn=collate_batch,
+            num_workers=NUM_WORKERS_OPTUNA, collate_fn=collate_batch,
             pin_memory=(DEVICE == "cuda"),
-            persistent_workers=(NUM_WORKERS > 0),
-            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else 2,
+            persistent_workers=(NUM_WORKERS_OPTUNA > 0),
+            prefetch_factor=PREFETCH_FINAL if NUM_WORKERS_OPTUNA > 0 else 2,
             multiprocessing_context=ctx,
         )
         dl_va = DataLoader(
             ds_va, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, collate_fn=collate_batch,
+            num_workers=NUM_WORKERS_OPTUNA, collate_fn=collate_batch,
             pin_memory=(DEVICE == "cuda"),
-            persistent_workers=(NUM_WORKERS > 0),
-            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else 2,
+            persistent_workers=(NUM_WORKERS_OPTUNA > 0),
+            prefetch_factor=PREFETCH_FINAL if NUM_WORKERS_OPTUNA > 0 else 2,
             multiprocessing_context=ctx,
         )
+
+        dl_tr = ThreadPrefetcher(dl_tr, max_prefetch=8)
+        dl_va = ThreadPrefetcher(dl_va, max_prefetch=4)
 
         model = BiasLSTM(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout).to(DEVICE)
         opt = AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -1028,14 +1134,19 @@ def main():
         n_folds=N_FOLDS,
         train_start_dt=None,
     )
-    print("test_start:", test_start)
-    for i, (train_end, vs, ve) in enumerate(folds):
-        print(f"  fold {i}: train_end<{train_end}  val=[{vs}, {ve})")
+    val_start_final, val_end_final, test_start = split_final_train_val_test_from_max(
+        prep_files,
+        test_days=TEST_DAYS,
+        val_days=VAL_DAYS_FINAL,
+        train_start_dt=None,
+        embargo_td=EMBARGO_TD,
+    )
 
-    val_start_final = test_start - timedelta(days=VAL_DAYS_FINAL)
     print("Final split dates:")
     print("  val_start_final:", val_start_final)
+    print("  val_end_final  :", val_end_final)
     print("  test_start     :", test_start)
+    print("  embargo        :", EMBARGO_TD)
 
     # ------------------------------------------------------------
     # 3) Fit normalization stats (TRAIN ONLY for final training) + save
@@ -1064,9 +1175,10 @@ def main():
         train_end,
         val_start,
         val_end,
+        seq_len,
         test_start=None,
-        num_workers: int = NUM_WORKERS,
-        prefetch_factor: int = PREFETCH_FACTOR,
+        num_workers: int = NUM_WORKERS_FINAL,
+        prefetch_factor: int = PREFETCH_FINAL,
     ):
         """
         train: [1900 .. train_end)
@@ -1079,7 +1191,7 @@ def main():
             time_min=pl.datetime(1900, 1, 1),
             time_max=train_end,
             feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=SEQ_LEN,
+            sid_col=STATION_ID_COL, seq_len=seq_len,
             mu=mu, sd=sd,
         )
         ds_va = PrepStreamSeqDataset(
@@ -1087,7 +1199,7 @@ def main():
             time_min=val_start,
             time_max=val_end,
             feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=SEQ_LEN,
+            sid_col=STATION_ID_COL, seq_len=seq_len,
             mu=mu, sd=sd,
         )
 
@@ -1098,7 +1210,7 @@ def main():
                 time_min=test_start,
                 time_max=pl.datetime(2200, 1, 1),
                 feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-                sid_col=STATION_ID_COL, seq_len=SEQ_LEN,
+                sid_col=STATION_ID_COL, seq_len=seq_len,
                 mu=mu, sd=sd,
             )
 
@@ -1137,13 +1249,14 @@ def main():
 
     if RUN_OPTUNA:
         def objective(trial: optuna.Trial):
-            hidden = trial.suggest_categorical("hidden", [64, 96, 128, 160, 192, 256])
-            num_layers = trial.suggest_int("num_layers", 1, 3)
+            hidden = trial.suggest_categorical("hidden", [160, 192, 256])
+            num_layers = trial.suggest_int("num_layers", 1, 1)
             dropout = trial.suggest_float("dropout", 0.0, 0.4)
             lr = trial.suggest_float("lr", 5e-5, 8e-4, log=True)
-            wd = trial.suggest_float("wd", 1e-7, 5e-3, log=True)
+            wd = trial.suggest_float("wd", 1e-6, 5e-3, log=True)
             grad_clip = trial.suggest_float("grad_clip", 0.5, 3.0)
             bs = trial.suggest_categorical("batch_size", [8192, 16384])
+            seq_len = trial.suggest_int("seq_len", 5, 24)
 
             fold_bests = []
             global_step = 0
@@ -1155,8 +1268,9 @@ def main():
                     train_end=train_end,
                     val_start=vs,
                     val_end=ve,
-                    num_workers=NUM_WORKERS,
-                    prefetch_factor=PREFETCH_FACTOR,
+                    num_workers=NUM_WORKERS_OPTUNA,
+                    prefetch_factor=PREFETCH_FINAL,
+                    seq_len=seq_len
                 )
 
 
@@ -1232,19 +1346,21 @@ def main():
         final_wd = float(best_params["wd"])
         final_clip = float(best_params["grad_clip"])
         final_bs = int(best_params["batch_size"])
+        final_seq_len = int(best_params["seq_len"])
     else:
-        final_hidden = 128
-        final_layers = 2
-        final_dropout = 0.2
-        final_lr = LR
-        final_wd = WD
-        final_clip = 2.0
+        final_hidden = 192
+        final_layers = 1
+        final_dropout = 0.2447411578889518
+        final_lr = 0.000727288685484562
+        final_wd = 0.000628977181948703
+        final_clip = 1.4159046082342293
         final_bs = BATCH_SIZE
+        final_seq_len = 24
 
     with open(run_dir / "final_training_config.json", "w") as f:
         json.dump(
             {
-                "seq_len": SEQ_LEN,
+                "seq_len": final_seq_len,
                 "batch_size": final_bs,
                 "hidden": final_hidden,
                 "num_layers": final_layers,
@@ -1258,13 +1374,16 @@ def main():
                 "trial_steps_per_epoch": TRIAL_STEPS_PER_EPOCH,
                 "trial_max_epochs": TRIAL_MAX_EPOCHS,
                 "trial_patience": TRIAL_PATIENCE,
-                "num_workers_final": NUM_WORKERS,
-                "prefetch_factor": PREFETCH_FACTOR,
+                "num_workers_final": NUM_WORKERS_FINAL,
+                "prefetch_factor": PREFETCH_FINAL,
                 "val_start_final": str(val_start_final),
+                "val_end_final": str(val_end_final),
                 "test_start": str(test_start),
                 "n_folds": N_FOLDS,
                 "test_days": TEST_DAYS,
                 "val_days_final": VAL_DAYS_FINAL,
+                "max_lead_hours": MAX_LEAD_HOURS,
+                "embargo_hours": MAX_LEAD_HOURS,
             },
             f,
             indent=2,
@@ -1277,10 +1396,12 @@ def main():
     dl_tr, dl_va, dl_ts = make_loaders(
         final_bs,
         train_end=val_start_final,     # train: < val_start_final
-        val_start=val_start_final,     # val:   [val_start_final, test_start)
-        val_end=test_start,
+        val_start=val_start_final,     # val:   [val_start_final, val_end_final)
+        val_end=val_end_final,
         test_start=test_start,         # test:  [test_start, ...)
-        num_workers=NUM_WORKERS,       # workers OK for the final run
+        num_workers=NUM_WORKERS_FINAL,
+        prefetch_factor=PREFETCH_FINAL,
+        seq_len=final_seq_len,
     )
 
     model = BiasLSTM(in_dim=in_dim, hidden=final_hidden, num_layers=final_layers, dropout=final_dropout).to(DEVICE)
@@ -1291,8 +1412,8 @@ def main():
     best_state = None
 
     for ep in range(MAX_EPOCHS):
-        tr_rmse = train_epoch_amp(model, dl_tr, opt, DEVICE, grad_clip=final_clip)
-        va_rmse = global_rmse_from_loader(model, dl_va, DEVICE)
+        tr_rmse = train_epoch_amp(model, dl_tr, opt, DEVICE, grad_clip=final_clip, max_steps=FINAL_STEPS_PER_EPOCH)
+        va_rmse = global_rmse_from_loader(model, dl_va, DEVICE, max_steps=FINAL_VAL_STEPS)
         print(f"Epoch {ep:03d}: train_rmse={tr_rmse:.4f} val_rmse={va_rmse:.4f}")
 
         if va_rmse < best_val - MIN_DELTA:
