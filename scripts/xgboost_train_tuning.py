@@ -128,6 +128,30 @@ def to_xy_bias(df_pl):
     return X, y
 
 def split_trainval_test(df):
+    """
+    Split a time-indexed Polars DataFrame into:
+      1) a fixed hold-out test set consisting of the last TEST_DAYS days, and
+      2) multiple rolling (time-ordered) train/validation folds built from the
+         remaining earlier data.
+    The split is based on the `validtime_dt` column (datetime).
+
+    Rolling folds:
+    - Unique `validtime_dt` timestamps within `df_tv` are sorted and used as
+      fold boundaries.
+    - The timeline is divided into (N_FOLDS + 1) roughly equal segments.
+    - For each fold i:
+        * Training data (`df_tr`) contains all rows with `validtime_dt` strictly
+          earlier than the fold’s validation start timestamp.
+        * Validation data (`df_va`) contains rows in a contiguous time window
+          starting at that timestamp (and ending at the next computed edge, if
+          applicable).
+    - Only folds with non-empty train and validation sets are kept.
+    Returns:
+        folds : list[tuple[pl.DataFrame, pl.DataFrame]]
+            List of (train_df, val_df) pairs for rolling cross-validation.
+        df_test : pl.DataFrame
+        Hold-out test set containing rows with `validtime_dt >= test_start`.
+    """
 
     # Last ~year as test set
     max_vt = df["validtime_dt"].max()
