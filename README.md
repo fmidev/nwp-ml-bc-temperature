@@ -2,74 +2,79 @@
 
 Machine learning workflows for bias-correcting near-surface temperature forecasts from numerical weather prediction (NWP) data.
 
-This repository contains Python scripts for training, running, and evaluating machine learning models that estimate temperature forecast bias. The data used by this project is not public, so this README focuses on the modeling workflow, expected prepared inputs, outputs, and script roles rather than documenting internal data extraction or raw data preparation steps.
+This repository contains research scripts for training, running inference, evaluating, and visualizing machine-learning-based temperature bias correction models. The data used by the project is not public, so this README focuses on the model workflow, expected prepared inputs, script roles, and generated outputs rather than documenting raw data access.
 
 ## Overview
 
-Numerical weather prediction models can contain systematic biases in 2-metre temperature forecasts. This project explores machine learning approaches for estimating the forecast error and applying a correction to the raw forecast.
+Numerical weather prediction models can contain systematic near-surface temperature biases. This project uses machine learning to estimate the forecast error and apply that estimate as a correction to the raw forecast.
 
-The main idea is to learn the temperature bias:
+The core target is the forecast temperature bias:
 
 ```text
 bias = observed_temperature - forecast_temperature
 ```
 
-and then apply the predicted bias to the raw forecast:
+The corrected forecast is then computed as:
 
 ```text
 corrected_temperature = raw_forecast_temperature + predicted_bias
 ```
 
-The repository is organized as a collection of research and experiment scripts rather than a packaged command-line application.
+The repository is organized as a collection of standalone experiment and analysis scripts rather than an installable Python package.
 
-## Repository structure
+## Current repository structure
 
 ```text
 .
 ├── scripts/
-│   ├── data_parsing.py
-│   ├── ml_data.py
-│   ├── xgboost_train_tuning.py
-│   ├── xgboost_inference.py
+│   ├── GNN_train_tuning.py
 │   ├── LSTM_train.py
 │   ├── LSTM_inference.py
-│   ├── GNN_train_tuning.py
+│   ├── xgboost_train_tuning.py
+│   ├── xgboost_inference.py
 │   ├── gnn_inference.py
-│   ├── mos_inference.py
-│   ├── forecast_summary.py
-│   ├── metrics_plot.py
+│   ├── shap_analysis.py
+│   ├── QQ-plot.py
+│   ├── correlation_plot.py
+│   ├── hit_rate.py
+│   ├── hit_rate_plot.py
+│   ├── metrics_station_plot.py
+│   ├── mos_plot_multi.py
+│   ├── observation_checks.py
+│   ├── observation_data.py
+│   ├── scatterplot_multi.py
+│   ├── single_analysistime_plot.py
 │   ├── station_plots.py
-│   └── ...
+│   └── gnn_station_plot.py
 ├── requirements.txt
-├── .gitignore
-└── LICENSE
+├── README.md
+├── LICENSE
+└── .gitignore
 ```
 
-## Data availability
+## Data
 
-The datasets used in this project are not public.
+The scripts expect prepared meteorological forecast, observation, and station datasets to already be available in the local execution environment. Some scripts may still contain local path assumptions from the research environment and should be reviewed before running elsewhere.
 
-Several scripts were developed for an internal/local research environment and may contain hard-coded local paths. Users outside that environment will need access to equivalent prepared datasets and may need to update paths before running the scripts.
+This README intentionally avoids documenting private source-data locations or raw data acquisition.
 
-This README therefore does not describe the full raw-data acquisition or internal preprocessing process. Instead, it documents the expected prepared data structure at a high level.
+## Expected input data
 
-## Expected prepared input data
+The model scripts expect prepared tabular forecast-observation data, typically in Parquet or CSV format depending on the script.
 
-The training and inference scripts expect prepared tabular forecast-observation datasets, typically stored as Parquet files.
-
-At a high level, the prepared data should contain:
+Common data concepts used across the workflow include:
 
 - station identifier
 - forecast analysis time
 - forecast valid time
 - forecast lead time
-- observed 2-metre air temperature
-- raw forecast 2-metre temperature
+- observed near-surface air temperature
+- raw forecast near-surface temperature
 - additional NWP predictor variables
 - station metadata such as longitude, latitude, and elevation
-- engineered temporal features such as hour-of-day and day-of-year encodings
+- derived time features such as hour-of-day and day-of-year encodings
 
-Common columns referenced by the scripts include:
+Common column names referenced by the modeling scripts include:
 
 ```text
 SID
@@ -99,76 +104,56 @@ cos_doy
 analysishour
 ```
 
-The exact required columns depend on the model and script being used.
+The exact required columns depend on the model and script being run.
 
 ## Installation
 
-Create a Python environment and install the project dependencies:
+Create and activate a Python environment:
 
 ```bash
 python -m venv venv
 source venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-For GPU or HPC environments, install PyTorch, XGBoost, and PyTorch Geometric according to the target system and CUDA version. Some deep learning dependencies may require environment-specific installation commands.
+The current dependency file includes packages for data processing, plotting, classical machine learning, deep learning, and graph neural network workflows, including `numpy`, `pandas`, `polars`, `pyarrow`, `matplotlib`, `seaborn`, `scikit-learn`, `xgboost`, `optuna`, `torch`, `torch-geometric`, `geopandas`, `shapely`, and `shap`.
+
+For GPU or HPC environments, install PyTorch, XGBoost, and PyTorch Geometric versions that are compatible with your CUDA and driver setup. The plain `requirements.txt` installation may not be sufficient for all GPU environments.
 
 ## Recommended workflow
 
-Because the repository consists of standalone scripts, the usual workflow is:
+A typical workflow is:
 
-1. Prepare or obtain compatible Parquet datasets.
-2. Check and adjust paths inside the relevant scripts.
+1. Prepare or obtain compatible internal datasets.
+2. Check paths and configuration values inside the script you want to run.
 3. Train a model.
 4. Run inference using the trained model.
-5. Generate metrics and plots.
+5. Generate evaluation plots and diagnostics.
 
-A typical local directory layout used by the scripts is:
+Example:
 
-```text
-~/thesis_project/
-├── data/
-│   ├── ml_data/
-│   ├── ml_data_full/
-│   └── ml_data_prepared/
-├── models/
-├── metrics/
-└── figures/
+```bash
+# Activate environment
+source venv/bin/activate
+
+# Train a model
+python scripts/xgboost_train_tuning.py
+
+# Run inference
+python scripts/xgboost_inference.py
+
+# Generate plots or diagnostics
+python scripts/QQ-plot.py
 ```
 
-You may use a different layout, but paths in the scripts should be updated accordingly.
+Because this repository contains standalone research scripts, review each script before running it in a new environment.
 
-## Script guide
-
-### Data interface and feature preparation
-
-These scripts are related to creating or transforming prepared machine learning datasets. They are included for reproducibility of the internal research workflow, but they may not run without access to the original non-public data.
-
-#### `scripts/data_parsing.py`
-
-Combines forecast data, station metadata, and observations into monthly Parquet files.
-
-This script is specific to the internal/local data layout and should be treated as an example of how the merged modeling dataset was produced. It may require non-public source files.
-
-#### `scripts/ml_data.py`
-
-Creates machine-learning-ready datasets from combined Parquet files.
-
-Typical operations include:
-
-- filtering stations
-- removing duplicate records
-- selecting model variables
-- creating time-based features
-- writing monthly Parquet files for model training
-
-This script is useful as a reference for expected model input features, but it may need path and column adjustments for other datasets.
-
-#### `scripts/ml_data_full.py` / related prepared-data scripts
-
-Additional dataset preparation variants used in experiments.
-
-These scripts should be reviewed before use because they may reflect a particular experiment, data period, station subset, or local file layout.
+## Main model workflows
 
 ### XGBoost workflow
 
@@ -176,16 +161,14 @@ These scripts should be reviewed before use because they may reflect a particula
 
 Trains an XGBoost model for temperature bias correction.
 
-The script is designed to:
+The training workflow is intended to:
 
-- read prepared ML Parquet files
+- read prepared ML-ready input data
 - define predictor variables
-- create time-based training, validation, and test splits
+- split data into training, validation, and test periods
 - tune hyperparameters with Optuna
 - train a final XGBoost model
-- save the trained model and tuning outputs
-
-The model target is the temperature bias, typically computed from observed and forecast temperatures.
+- save trained model artifacts and tuning outputs
 
 Run:
 
@@ -195,23 +178,24 @@ python scripts/xgboost_train_tuning.py
 
 Before running, check:
 
-- input data paths
-- output model path
-- selected feature columns
-- date ranges used for train/validation/test splitting
-- Optuna trial count and training settings
+- input data path
+- output path
+- feature list
+- train/validation/test date logic
+- Optuna trial settings
+- available CPU/GPU resources
 
 #### `scripts/xgboost_inference.py`
 
-Runs inference using a trained XGBoost model.
+Runs inference with a trained XGBoost model.
 
-The script typically:
+The inference workflow is intended to:
 
-- loads a saved XGBoost model
-- reads prepared input data
-- predicts the forecast bias
-- applies the predicted correction to the raw temperature forecast
-- writes evaluation output for later metrics and plotting
+- load a trained XGBoost model
+- read prepared input data
+- predict the forecast bias
+- apply the correction to raw temperature forecasts
+- write outputs for later evaluation or plotting
 
 Run:
 
@@ -219,20 +203,15 @@ Run:
 python scripts/xgboost_inference.py
 ```
 
-Before running, check:
-
-- model file path
-- input data path
-- output metrics path
-- feature list consistency with training
+Before running, verify that the feature list and preprocessing match the training script.
 
 ### LSTM workflow
 
 #### `scripts/LSTM_train.py`
 
-Trains an LSTM-based model for temperature bias correction.
+Trains an LSTM-based bias-correction model with PyTorch.
 
-The script uses prepared time-series-style input data and trains a neural network model with PyTorch.
+The LSTM workflow uses prepared time-series-style input data and learns to predict temperature forecast error from sequential station and forecast features.
 
 Run:
 
@@ -242,18 +221,18 @@ python scripts/LSTM_train.py
 
 Before running, check:
 
+- prepared input path
+- output model path
 - sequence construction logic
-- selected features
-- training/validation/test periods
-- batch size and number of epochs
-- model output path
-- CPU/GPU settings
+- feature list
+- batch size
+- number of epochs
+- train/validation/test split
+- GPU configuration
 
 #### `scripts/LSTM_inference.py`
 
-Runs inference for a trained LSTM model.
-
-The script loads a saved model and applies it to prepared forecast data.
+Runs inference using a trained LSTM model.
 
 Run:
 
@@ -261,15 +240,20 @@ Run:
 python scripts/LSTM_inference.py
 ```
 
-Before running, verify that the inference feature order and preprocessing match the training script.
+Before running, confirm that:
+
+- the correct model checkpoint is loaded
+- normalization/statistics files match the trained model
+- the inference feature order matches training
+- output directories exist or can be created
 
 ### Graph neural network workflow
 
 #### `scripts/GNN_train_tuning.py`
 
-Trains and tunes a graph-based model workflow.
+Trains and tunes a graph-based temperature bias-correction model.
 
-The graph workflow is intended to use station metadata and meteorological features in a spatial learning setup. It uses PyTorch and PyTorch Geometric.
+The GNN workflow is intended to use station metadata and meteorological predictors in a spatial learning setup. It relies on PyTorch and PyTorch Geometric.
 
 Run:
 
@@ -296,137 +280,89 @@ Run:
 python scripts/gnn_inference.py
 ```
 
-Before running, confirm that the graph structure, station ordering, and feature preprocessing match training.
+Before running, verify that:
 
-### MOS baseline / comparison workflow
+- the graph structure matches training
+- station ordering is consistent
+- feature preprocessing matches the training workflow
+- the correct model run directory is used
 
-#### `scripts/mos_inference.py`
+## Analysis and visualization scripts
 
-Runs inference or evaluation for a MOS-style baseline/comparison workflow.
+The repository includes plotting and diagnostic scripts for model evaluation.
 
-Use this script to compare machine learning corrections against an existing statistical correction or baseline forecast, where available.
+### Forecast and station diagnostics
 
-Before running, check the expected input files and output metric paths.
+- `station_plots.py` — station-level visualizations
+- `gnn_station_plot.py` — station plots for GNN outputs
+- `observation_checks.py` — observation-data checks and diagnostics
+- `observation_data.py` — observation-related processing/checking
+- `correlation_plot.py` — correlation visualizations
 
-### Evaluation and plotting scripts
+### Model evaluation plots
 
-The repository includes scripts for summarizing results and producing diagnostic plots.
+- `QQ-plot.py` — Q-Q plots for forecast or model error distributions
+- `metrics_station_plot.py` — station-level metric plots
+- `hit_rate.py` — hit-rate metric calculations
+- `hit_rate_plot.py` — hit-rate visualizations
+- `scatterplot_multi.py` — multi-panel scatter plots
+- `single_analysistime_plot.py` — plots for selected forecast analysis times
+- `mos_plot_multi.py` — MOS-vs-ML comparison visualizations
+- `shap_analysis.py` — SHAP-based feature-effect analysis
 
-Common analysis scripts include:
-
-- `forecast_summary.py`
-- `forecast_summary_plots.py`
-- `metrics_plot.py`
-- `metrics_station_plot.py`
-- `QQ-plot.py`
-- `correlation_plot.py`
-- `hit_rate.py`
-- `hit_rate_plot.py`
-- `station_plots.py`
-- `station_group_plot.py`
-- `scatterplot_multi.py`
-- `pred_obs_plot.py`
-- `shap_analysis.py`
-
-These scripts are generally used after inference outputs have been written.
-
-Typical outputs include:
-
-```text
-metrics/
-figures/
-```
-
-Before running plotting scripts, check:
-
-- expected metrics file names
-- expected column names
-- output figure directory
-- station grouping or filtering assumptions
-
-## Example workflow
-
-The exact commands depend on the available prepared data and local paths, but a typical workflow is:
-
-```bash
-# 1. Activate environment
-source venv/bin/activate
-
-# 2. Optional: create or transform ML-ready data
-# Requires access to compatible prepared/internal data.
-python scripts/ml_data.py
-
-# 3. Train a model
-python scripts/xgboost_train_tuning.py
-
-# 4. Run inference
-python scripts/xgboost_inference.py
-
-# 5. Generate plots or metrics summaries
-python scripts/metrics_plot.py
-```
-
-## Important notes
-
-- The raw data used by this project is not public.
-- Some scripts contain hard-coded local paths and may require editing before use.
-- The repository is not currently structured as an installable Python package.
-- The scripts should be reviewed before running in a new environment.
-- Feature lists must remain consistent between training and inference.
-- Deep learning workflows may require environment-specific GPU/CUDA setup.
-- Generated data, models, metrics, and figures should not be committed unless intentionally added.
+Most plotting scripts expect inference or metrics outputs to already exist.
 
 ## Outputs
 
-Depending on the workflow, generated outputs may include:
+Depending on the script, generated outputs may include:
 
 ```text
-data/ml_data/
-data/ml_data_full/
-data/ml_data_prepared/
 models/
 metrics/
 figures/
 ```
 
-The repository `.gitignore` excludes many generated files and directories, including data, figures, metrics, models, JSON outputs, virtual environments, caches, and CSV files.
+Generated data, models, metrics, figures, CSV files, caches, virtual environments, and IDE files are excluded by `.gitignore`.
 
 ## Troubleshooting
 
 ### `FileNotFoundError`
 
-Check whether the script contains a local hard-coded path. Update the input/output path to match your environment.
+Check the input path expected by the script. The data is not public, so local paths must point to internally available prepared datasets.
 
 ### Missing columns
 
-Check that the prepared Parquet files contain the required feature columns for the selected model. Training and inference scripts must use the same feature order and preprocessing.
+Check that the prepared input file contains the features required by the selected script. Training and inference scripts must use the same feature names and feature ordering.
 
-### PyTorch Geometric installation errors
+### GPU or CUDA errors
 
-Install PyTorch and PyTorch Geometric using versions compatible with your Python, CUDA, and system environment.
+Check your PyTorch, CUDA, driver, and PyTorch Geometric versions. On shared GPU/HPC systems, verify that the selected CUDA device is available.
 
 ### Different results between training and inference
 
 Verify that:
 
 - the same feature list is used
+- the same preprocessing and normalization are used
 - station ordering is consistent
-- temporal features are generated in the same way
-- scaling or preprocessing steps are identical
-- the correct model checkpoint is loaded
+- graph construction is identical for GNN inference
+- the correct checkpoint/model artifacts are loaded
 
-## Suggested improvements
+## Development notes
 
-Future improvements that would make the repository easier to reuse include:
+This repository is currently a research-script repository, not a packaged Python library.
 
-- Add a central configuration file for paths and model settings.
-- Replace hard-coded paths with command-line arguments.
-- Add a small synthetic or mock dataset for testing.
-- Add scripts that validate the input schema before training.
-- Move shared feature lists and utilities into common modules.
-- Add automated tests for feature engineering and metrics.
-- Add CI checks for formatting and linting.
-- Document each model workflow in separate files under `docs/`.
+Recommended future improvements:
+
+- Add a central path/configuration utility.
+- Add an example config file for local paths.
+- Replace remaining hard-coded paths with command-line arguments.
+- Add a small synthetic dataset for testing.
+- Add input schema checks before training and inference.
+- Move shared feature definitions into a common module.
+- Add tests for metrics and preprocessing utilities.
+- Add CI checks for formatting and syntax.
+- Document model-specific workflows under a `docs/` directory.
 
 ## License
 
