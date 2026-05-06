@@ -157,6 +157,8 @@ analysishour
 
 The exact required columns depend on the model and script being run.
 
+Most plotting and analysis scripts require a comparator model called MOS.
+
 ## Installation
 
 Create and activate a Python environment:
