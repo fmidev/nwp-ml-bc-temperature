@@ -1,14 +1,53 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # choose GPU #1
+import argparse
+
+
+def parse_pre_args():
+    """
+    Parse CUDA/thread settings before importing torch.
+
+    CUDA_VISIBLE_DEVICES should be set before torch is imported.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+
+    parser.add_argument(
+        "--cuda-visible-devices",
+        default=None,
+        type=str,
+        help="CUDA_VISIBLE_DEVICES value, for example '0', '1', or empty string.",
+    )
+
+    parser.add_argument(
+        "--threads",
+        default="4",
+        type=str,
+        help="Thread count for OMP_NUM_THREADS, MKL_NUM_THREADS, and POLARS_MAX_THREADS.",
+    )
+
+    args, _ = parser.parse_known_args()
+
+    if args.cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    os.environ.setdefault("OMP_NUM_THREADS", args.threads)
+    os.environ.setdefault("MKL_NUM_THREADS", args.threads)
+    os.environ.setdefault("POLARS_MAX_THREADS", args.threads)
+
+
+parse_pre_args()
 
 import math
 import random
-import argparse
 from pathlib import Path
 from datetime import timedelta
 from glob import glob
 from collections import defaultdict, deque
 import json
+import pickle
+import gc
+from datetime import datetime
+import threading
+import queue
 
 import numpy as np
 import polars as pl
@@ -17,131 +56,500 @@ from torch import nn
 from torch.utils.data import IterableDataset, DataLoader
 from torch.optim import AdamW
 from torch.utils.data import get_worker_info
+import torch.multiprocessing as mp
 
 import optuna
 from optuna.exceptions import TrialPruned
-import pickle
-import gc
-
-import time
-from datetime import datetime
-import torch.multiprocessing as mp
-
-import threading, queue
-
 
 
 # -------------------------
-# Config
+# Fixed columns
 # -------------------------
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 42
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
-
-HOME = Path.home()
-RAW_GLOB = HOME / "thesis_project" / "data" / "ml_data_full" / "ml_data_full_*.parquet"
-PREP_DIR = HOME / "thesis_project" / "data" / "ml_data_prepared"
-PREP_DIR.mkdir(parents=True, exist_ok=True)
-PREP_GLOB = PREP_DIR / "ml_data_prep_*.parquet"
 
 FEATS = [
-    "T2","SKT","MX2T","MN2T","D2","T_925","MSL","U10","V10","T2_M1","T_925_M1",
-    "T2_ENSMEAN_MA1", "LCC", "MCC", "sin_hod","cos_hod","sin_doy","cos_doy",
-    "analysishour","leadtime","lon","lat","elev"
+    "T2", "SKT", "MX2T", "MN2T", "D2", "T_925", "MSL", "U10", "V10",
+    "T2_M1", "T_925_M1", "T2_ENSMEAN_MA1",
+    "LCC", "MCC",
+    "sin_hod", "cos_hod", "sin_doy", "cos_doy",
+    "analysishour", "leadtime", "lon", "lat", "elev",
 ]
+
 LABEL_OBS = "obs_TA"
-TEMP_FC   = "T2"
+TEMP_FC = "T2"
 STATION_ID_COL = "SID"
 
-#SEQ_LEN = 5
-BATCH_SIZE = 16384          # use your VRAM
-MAX_EPOCHS = 200
-PATIENCE = 8
-MIN_DELTA = 1e-4
-LR = 3e-4
-WD = 1e-5
 
 # -------------------------
-# Optuna / tuning controls
+# Runtime globals set in main()
 # -------------------------
-RUN_OPTUNA = True
-N_TRIALS = 30
 
-# For IterableDataset we must cap work per trial, otherwise each "epoch" is huge.
-TRIAL_STEPS_PER_EPOCH = 200   # e.g. 200–2000
-TRIAL_MAX_EPOCHS = 50       # per trial
-TRIAL_PATIENCE = 3            # per trial early stopping
+DEVICE = None
+SEED = None
 
-FINAL_STEPS_PER_EPOCH = 1000 
-FINAL_VAL_STEPS       = 500
+RAW_GLOB = None
+PREP_DIR = None
+PREP_GLOB = None
 
-TEST_DAYS = 365
-VAL_DAYS_FINAL = 90
-N_FOLDS = 3
+MODEL_DIR = None
+MODEL_TAG = None
+MODEL_PATH = None
+STATS_PATH = None
+
+RUN_OPTUNA = None
+
+BATCH_SIZE = None
+MAX_EPOCHS = None
+PATIENCE = None
+MIN_DELTA = None
+LR = None
+WD = None
+
+N_TRIALS = None
+TRIAL_STEPS_PER_EPOCH = None
+TRIAL_MAX_EPOCHS = None
+TRIAL_PATIENCE = None
+
+FINAL_STEPS_PER_EPOCH = None
+FINAL_VAL_STEPS = None
+
+TEST_DAYS = None
+VAL_DAYS_FINAL = None
+N_FOLDS = None
+
+STATS_SAMPLE_PER_FILE = None
+
+NUM_WORKERS_OPTUNA = None
+PREFETCH_FINAL = None
+NUM_WORKERS_FINAL = None
+
+MAX_LEAD_HOURS = None
+EMBARGO_TD = None
 
 
-# Stats fitting
-STATS_SAMPLE_PER_FILE = 20_000
+# -------------------------
+# Arguments
+# -------------------------
 
-# Loader tuning (effective only after prepare step)
-NUM_WORKERS_OPTUNA = 0
-PREFETCH_FINAL = 2
-NUM_WORKERS_FINAL = 4
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train BiasLSTM with optional Optuna tuning using prepared parquet files."
+    )
 
-# Artifacts for inference
-MODEL_DIR = HOME / "thesis_project" / "models"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = MODEL_DIR / "bias_lstm_stream.pt"
-STATS_PATH = MODEL_DIR / "bias_lstm_stream_stats.json"
+    parser.add_argument(
+        "--raw-input",
+        required=True,
+        type=str,
+        help=(
+            "Raw input parquet file, directory, or glob pattern. "
+            "Used when --prepare is given. "
+            "Example: /path/to/ml_data_full/ml_data_full_*.parquet"
+        ),
+    )
 
-MAX_LEAD_HOURS = 240
-EMBARGO_TD = timedelta(hours=MAX_LEAD_HOURS)
+    parser.add_argument(
+        "--prep-dir",
+        required=True,
+        type=str,
+        help="Directory where prepared parquet files are written/read.",
+    )
+
+    parser.add_argument(
+        "--model-dir",
+        required=True,
+        type=str,
+        help="Directory where model run directories are saved.",
+    )
+
+    parser.add_argument(
+        "--model-tag",
+        default="bias_lstm_stream",
+        type=str,
+        help="Model tag used for saved model/stat filenames. Default: bias_lstm_stream.",
+    )
+
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Create prepared parquet files and exit.",
+    )
+
+    parser.add_argument(
+        "--run-optuna",
+        action="store_true",
+        help="Run Optuna tuning. If omitted, fixed default hyperparameters are used.",
+    )
+
+    parser.add_argument(
+        "--n-trials",
+        default=30,
+        type=int,
+        help="Number of Optuna trials. Default: 30.",
+    )
+
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Training device. Default: auto.",
+    )
+
+    parser.add_argument(
+        "--cuda-visible-devices",
+        default=None,
+        type=str,
+        help="CUDA_VISIBLE_DEVICES value. Parsed before torch import.",
+    )
+
+    parser.add_argument(
+        "--threads",
+        default="4",
+        type=str,
+        help="Thread count. Parsed before torch import.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        default=42,
+        type=int,
+        help="Random seed. Default: 42.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        default=16384,
+        type=int,
+        help="Default/final batch size if Optuna is not used. Default: 16384.",
+    )
+
+    parser.add_argument(
+        "--max-epochs",
+        default=200,
+        type=int,
+        help="Maximum final training epochs. Default: 200.",
+    )
+
+    parser.add_argument(
+        "--patience",
+        default=8,
+        type=int,
+        help="Final training early stopping patience. Default: 8.",
+    )
+
+    parser.add_argument(
+        "--min-delta",
+        default=1e-4,
+        type=float,
+        help="Minimum validation improvement for early stopping. Default: 1e-4.",
+    )
+
+    parser.add_argument(
+        "--lr",
+        default=3e-4,
+        type=float,
+        help="Default learning rate if fixed params are used. Default: 3e-4.",
+    )
+
+    parser.add_argument(
+        "--wd",
+        default=1e-5,
+        type=float,
+        help="Default weight decay if fixed params are used. Default: 1e-5.",
+    )
+
+    parser.add_argument(
+        "--trial-steps-per-epoch",
+        default=200,
+        type=int,
+        help="Max training steps per Optuna epoch. Default: 200.",
+    )
+
+    parser.add_argument(
+        "--trial-max-epochs",
+        default=50,
+        type=int,
+        help="Max epochs per Optuna trial fold. Default: 50.",
+    )
+
+    parser.add_argument(
+        "--trial-patience",
+        default=3,
+        type=int,
+        help="Optuna trial early stopping patience. Default: 3.",
+    )
+
+    parser.add_argument(
+        "--final-steps-per-epoch",
+        default=1000,
+        type=int,
+        help="Max final training steps per epoch. Default: 1000.",
+    )
+
+    parser.add_argument(
+        "--final-val-steps",
+        default=500,
+        type=int,
+        help="Max final validation steps. Default: 500.",
+    )
+
+    parser.add_argument(
+        "--test-days",
+        default=365,
+        type=int,
+        help="Number of final days used as test period. Default: 365.",
+    )
+
+    parser.add_argument(
+        "--val-days-final",
+        default=90,
+        type=int,
+        help="Final validation window length in days. Default: 90.",
+    )
+
+    parser.add_argument(
+        "--n-folds",
+        default=3,
+        type=int,
+        help="Number of rolling CV folds for Optuna. Default: 3.",
+    )
+
+    parser.add_argument(
+        "--stats-sample-per-file",
+        default=20_000,
+        type=int,
+        help="Rows sampled per prepared file when fitting normalization stats. Default: 20000.",
+    )
+
+    parser.add_argument(
+        "--num-workers-optuna",
+        default=0,
+        type=int,
+        help="DataLoader workers during Optuna. Default: 0.",
+    )
+
+    parser.add_argument(
+        "--num-workers-final",
+        default=4,
+        type=int,
+        help="DataLoader workers during final training. Default: 4.",
+    )
+
+    parser.add_argument(
+        "--prefetch-final",
+        default=2,
+        type=int,
+        help="DataLoader prefetch factor for final training. Default: 2.",
+    )
+
+    parser.add_argument(
+        "--max-lead-hours",
+        default=240,
+        type=int,
+        help="Maximum lead time in hours, also used as embargo. Default: 240.",
+    )
+
+    parser.add_argument(
+        "--fixed-params-json",
+        default=None,
+        type=str,
+        help=(
+            "Optional JSON file with fixed final params. "
+            "If provided and --run-optuna is not used, these params override defaults."
+        ),
+    )
+
+    return parser.parse_args()
 
 
-import torch.multiprocessing as mp
+def resolve_glob(path_arg: str, default_pattern: str) -> str:
+    """
+    Accept a file, directory, or glob pattern.
+    """
+    p = Path(path_arg)
+
+    if p.is_dir():
+        return str(p / default_pattern)
+
+    return str(p)
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 def _set_mp_spawn():
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
-        # already set in this interpreter
         pass
-
 
 
 # -------------------------
 # Utilities
 # -------------------------
 
-def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3, train_start_dt=None, embargo_td = EMBARGO_TD):
-    """
-        -Splits made using analysistime instead of validtime like in XGB/GNN to keep full forecasts intact
-        - train_end = val_start - embargo_td
-        -Added embargo_td to not leak information into the next fold
-    Returns:
-      folds = list of (train_end, val_start, val_end) as datetimes
-      test_start
-    """
+def list_files(path_glob):
+    files = sorted(glob(str(path_glob)))
 
-    # Get global max validtime_dt
+    if not files:
+        raise FileNotFoundError(f"No parquet files matched: {path_glob}")
+
+    return files
+
+
+def scan_base(fp: str):
+    """
+    Robust scanner that supports either:
+      - analysistime_dt/validtime_dt already present
+      - analysistime/validtime as strings
+    """
+    try:
+        lf = pl.scan_parquet(fp).select(
+            FEATS + [LABEL_OBS, STATION_ID_COL, "analysistime_dt", "validtime_dt"]
+        )
+        _ = lf.head(0).collect(engine="streaming")
+        lf = lf.with_columns(pl.col("analysishour").cast(pl.Int16))
+        return lf
+    except Exception:
+        pass
+
+    lf = pl.scan_parquet(fp).select(
+        FEATS + [LABEL_OBS, STATION_ID_COL, "analysistime", "validtime"]
+    )
+
+    lf = (
+        lf.with_columns(
+            pl.col("analysistime")
+            .cast(pl.Utf8)
+            .str.strptime(pl.Datetime, strict=False)
+            .alias("analysistime_dt"),
+
+            pl.col("validtime")
+            .cast(pl.Utf8)
+            .str.strptime(pl.Datetime, strict=False)
+            .alias("validtime_dt"),
+
+            pl.col("analysishour").cast(pl.Int16),
+        )
+        .drop(["analysistime", "validtime"])
+    )
+
+    _ = lf.head(0).collect(engine="streaming")
+
+    return lf
+
+
+def dedup_per_station_validtime(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.sort([STATION_ID_COL, "analysistime_dt", "leadtime", "validtime_dt"])
+        .unique(
+            subset=[STATION_ID_COL, "analysistime_dt", "leadtime", "analysishour"],
+            keep="last",
+        )
+    )
+
+
+def add_dt_hours(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.sort([STATION_ID_COL, "leadtime", "analysistime_dt"])
+        .with_columns(
+            (
+                pl.col("analysistime_dt")
+                .diff()
+                .over([STATION_ID_COL, "leadtime"])
+                .dt.total_hours()
+                .fill_null(0.0)
+                .clip(0.0, 24.0 * 30.0)
+                .alias("dt_hours")
+            )
+        )
+    )
+
+
+def add_dt_valid_hours(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.sort([STATION_ID_COL, "analysistime_dt", "validtime_dt"])
+        .with_columns(
+            (
+                pl.col("validtime_dt")
+                .diff()
+                .over([STATION_ID_COL, "analysistime_dt"])
+                .dt.total_hours()
+                .fill_null(0.0)
+                .clip(0.0, 24.0 * 30.0)
+                .alias("dt_valid_hours")
+            )
+        )
+    )
+
+
+def get_global_minmax_validtime(files):
+    vt_min = None
+    vt_max = None
+
+    for fp in files:
+        lf = scan_base(fp).select("validtime_dt")
+
+        df = (
+            lf.select(
+                pl.col("validtime_dt").min().alias("mn"),
+                pl.col("validtime_dt").max().alias("mx"),
+            )
+            .collect(engine="streaming")
+        )
+
+        mn = df["mn"][0]
+        mx = df["mx"][0]
+
+        if mn is None or mx is None:
+            continue
+
+        vt_min = mn if vt_min is None else min(vt_min, mn)
+        vt_max = mx if vt_max is None else max(vt_max, mx)
+
+    if vt_min is None or vt_max is None:
+        raise RuntimeError("Could not infer validtime_dt min/max from files.")
+
+    return vt_min, vt_max
+
+
+def split_trainval_test_rolling_from_files(
+    prep_files,
+    test_days=365,
+    n_folds=3,
+    train_start_dt=None,
+    embargo_td=None,
+):
+    """
+    Rolling folds using analysistime, with embargo before validation.
+    """
+    if embargo_td is None:
+        embargo_td = EMBARGO_TD
+
     _, vt_max = get_global_minmax_validtime(prep_files)
     test_start = vt_max - timedelta(days=test_days)
 
     latest_val_init = test_start - embargo_td
 
-    # Gather unique analysistime_dt in TV window (streaming per file)
     chunks = []
+
     for fp in prep_files:
         lf = pl.scan_parquet(fp).select("analysistime_dt")
 
         if train_start_dt is None:
             lf = lf.filter(pl.col("analysistime_dt") < latest_val_init)
         else:
-            lf = lf.filter((pl.col("analysistime_dt") < latest_val_init) & (pl.col("analysistime_dt") >= train_start_dt))
+            lf = lf.filter(
+                (pl.col("analysistime_dt") < latest_val_init)
+                & (pl.col("analysistime_dt") >= train_start_dt)
+            )
 
         df = lf.unique().collect(engine="streaming")
+
         if df.height:
             chunks.append(df)
 
@@ -150,31 +558,34 @@ def split_trainval_test_rolling_from_files(prep_files, test_days=365, n_folds=3,
 
     inits = (
         pl.concat(chunks, how="vertical_relaxed")
-          .unique()
-          .sort("analysistime_dt")["analysistime_dt"]
-          .to_list()
+        .unique()
+        .sort("analysistime_dt")["analysistime_dt"]
+        .to_list()
     )
 
     if len(inits) < n_folds + 1:
-        raise ValueError("Not enough initializations for requested N_FOLDS after applying TRAIN_START_DT.")
+        raise ValueError("Not enough initializations for requested folds.")
 
-    fold_edges = [int(round(i * len(inits) / (n_folds + 1))) for i in range(1, n_folds + 1)]
+    fold_edges = [
+        int(round(i * len(inits) / (n_folds + 1)))
+        for i in range(1, n_folds + 1)
+    ]
+
     step = (fold_edges[1] - fold_edges[0]) if len(fold_edges) > 1 else fold_edges[0]
 
     folds = []
+
     for edge in fold_edges:
         val_start = inits[edge - 1]
 
         next_edge = min(edge + step, len(inits))
-        if next_edge > edge:
-            val_end = inits[next_edge - 1]
-        else:
-            val_end = inits[-1]
+        val_end = inits[next_edge - 1] if next_edge > edge else inits[-1]
 
         train_end = val_start - embargo_td
 
         if train_start_dt is not None and train_end <= train_start_dt:
             continue
+
         if train_end >= val_start:
             continue
 
@@ -191,23 +602,17 @@ def split_final_train_val_test_from_max(
     test_days=365,
     val_days=90,
     train_start_dt=None,
-    embargo_td=EMBARGO_TD,
+    embargo_td=None,
 ):
     """
     Final split with embargo between validation and test.
-
-    Returns:
-      val_start, val_end, test_start
-
-      train: analysistime_dt < val_start
-      val:   analysistime_dt >= val_start and analysistime_dt < val_end
-      test:  analysistime_dt >= test_start
-
-      embargo region [val_end, test_start) is dropped.
     """
-    _, vt_max = get_global_minmax_validtime(prep_files)
-    test_start = vt_max - timedelta(days=test_days)
+    if embargo_td is None:
+        embargo_td = EMBARGO_TD
 
+    _, vt_max = get_global_minmax_validtime(prep_files)
+
+    test_start = vt_max - timedelta(days=test_days)
     val_end = test_start - embargo_td
     val_start = val_end - timedelta(days=val_days)
 
@@ -217,191 +622,41 @@ def split_final_train_val_test_from_max(
     return val_start, val_end, test_start
 
 
-
-
-
-def list_files(path_glob: Path):
-    files = sorted(glob(str(path_glob)))
-    if not files:
-        raise FileNotFoundError(f"No parquet files matched: {path_glob}")
-    return files
-
-
-def scan_base(fp: str):
-    """
-    Robust scanner that supports either:
-      - analysistime_dt/validtime_dt already present in parquet, OR
-      - analysistime/validtime as strings that need parsing.
-    Uses a try/fallback (schema-based checks can be unreliable on older polars).
-    """
-    # Try dt columns first
-    try:
-        lf = pl.scan_parquet(fp).select(
-            FEATS + [LABEL_OBS, STATION_ID_COL, "analysistime_dt", "validtime_dt"]
-        )
-        _ = lf.head(0).collect(engine="streaming")
-        lf = lf.with_columns(pl.col("analysishour").cast(pl.Int16))
-        return lf
-    except Exception:
-        pass
-
-    # Fallback to string columns
-    lf = pl.scan_parquet(fp).select(
-        FEATS + [LABEL_OBS, STATION_ID_COL, "analysistime", "validtime"]
-    )
-    lf = lf.with_columns(
-        pl.col("analysistime").str.strptime(pl.Datetime, strict=False).alias("analysistime_dt"),
-        pl.col("validtime").str.strptime(pl.Datetime, strict=False).alias("validtime_dt"),
-        pl.col("analysishour").cast(pl.Int16),
-    ).drop(["analysistime", "validtime"])
-    _ = lf.head(0).collect(engine="streaming")
-    return lf
-
-
-def dedup_per_station_validtime(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Deterministic de-duplication per station and forecast cycle.
-
-    Sorts rows by station id, analysis time, leadtime, and valid time so that a
-    consistent “last row wins” rule can be applied. Then drops duplicates based on
-    (station id, analysistime_dt, leadtime, analysishour), keeping only the last
-    occurrence in the sorted order.
-
-    Useful when the same forecast hour/cycle appears multiple times (e.g. reprocessing
-    or overlapping loads) and you want one canonical record.
-    """
-    return (
-        df.sort([STATION_ID_COL, "analysistime_dt", "leadtime", "validtime_dt"])
-          .unique(subset=[STATION_ID_COL, "analysistime_dt", "leadtime", "analysishour"], keep="last")
-    )
-
-
-def add_dt_hours(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Adds per-station, per-leadtime time-step size (hours) between analysis times.
-
-    Within each (station id, leadtime) group, computes the difference between consecutive
-    analysistime_dt values, converts that duration to hours, and stores it as dt_hours.
-
-    - The first row of each group has no previous timestamp, so dt_hours is filled with 0.0.
-    - Negative steps (out-of-order data) are clipped to 0.0.
-    - Very large gaps are capped at 30 days (720 hours) to avoid extreme outliers.
-
-    Assumes analysistime_dt is a Polars Datetime column.
-    """
-    return (
-        df.sort([STATION_ID_COL, "leadtime", "analysistime_dt"])
-          .with_columns(
-              (pl.col("analysistime_dt")
-                 .diff()
-                 .over([STATION_ID_COL, "leadtime"])
-                 .dt.total_hours()
-                 .fill_null(0.0)
-                 .clip(0.0, 24.0 * 30.0)
-                 .alias("dt_hours")
-              )
-          )
-    )
-
-def add_dt_valid_hours(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Add a `dt_valid_hours` column containing the time difference in hours
-    between consecutive `validtime_dt` values within each station and
-    `analysistime_dt` group.
-
-    The input is first sorted by station, analysis time, and valid time so
-    that differences are calculated in chronological order. The first row in
-    each group gets 0.0, and all values are clipped to the range [0, 30 days].
-    """
-    return (
-        df.sort([STATION_ID_COL, "analysistime_dt", "validtime_dt"])
-          .with_columns(
-              (
-                  # Compute the difference between consecutive valid times
-                  # for each (station, analysistime) group.
-                  pl.col("validtime_dt")
-                    .diff()
-                    .over([STATION_ID_COL, "analysistime_dt"])
-                    .dt.total_hours()
-                    # The first row in each group has no previous value,
-                    # so replace null with 0.0 hours.
-                    .fill_null(0.0)
-                    .clip(0.0, 24.0 * 30.0)
-                    .alias("dt_valid_hours")
-              )
-          )
-    )
-
-
-def get_global_minmax_validtime(files):
-    """
-    Computes global valid-time coverage across a list of parquet inputs.
-
-    Iterates over files, lazily scans each one and extracts min/max of validtime_dt.
-    Aggregates these into a single overall (vt_min, vt_max) spanning *all* files.
-
-    - Skips files where validtime_dt min/max cannot be inferred (e.g. empty partitions).
-    - Uses streaming collect to keep memory usage low.
-    - Raises RuntimeError if no usable min/max values are found in any file.
-
-    Returns:
-        (vt_min, vt_max): earliest and latest validtime_dt across all provided files.
-    """
-    vt_min = None
-    vt_max = None
-    for fp in files:
-        lf = scan_base(fp).select("validtime_dt")
-        df = lf.select(
-            pl.col("validtime_dt").min().alias("mn"),
-            pl.col("validtime_dt").max().alias("mx"),
-        ).collect(engine="streaming")
-        mn = df["mn"][0]
-        mx = df["mx"][0]
-        if mn is None or mx is None:
-            continue
-        vt_min = mn if vt_min is None else min(vt_min, mn)
-        vt_max = mx if vt_max is None else max(vt_max, mx)
-    if vt_min is None or vt_max is None:
-        raise RuntimeError("Could not infer validtime_dt min/max from files.")
-    return vt_min, vt_max
-
-
 def split_ranges_from_files(files, test_days=365, val_days=90):
     _, vt_max = get_global_minmax_validtime(files)
+
     test_start = vt_max - timedelta(days=test_days)
-    val_start  = test_start - timedelta(days=val_days)
+    val_start = test_start - timedelta(days=val_days)
+
     return val_start, test_start
 
 
 # -------------------------
-# PREPARE STEP (one-time)
+# Prepare step
 # -------------------------
+
 def prepare_files_once(raw_files):
     """
-    Creates prepared parquet files:
-      - select needed columns
-      - ensure *_dt exist
-      - dedup + dt_hours
-      - sort by (SID, analysistime_dt, validtime_dt)
-    Output: PREP_DIR/ml_data_prep_*.parquet
+    Create prepared parquet files.
     """
     needed = [STATION_ID_COL, "validtime_dt", "analysistime_dt", *FEATS, LABEL_OBS]
+
+    PREP_DIR.mkdir(parents=True, exist_ok=True)
+
     for fp in raw_files:
         out = PREP_DIR / (Path(fp).name.replace("ml_data_full_", "ml_data_prep_"))
+
         if out.exists():
             continue
 
         df = scan_base(fp).select(needed).collect(engine="streaming")
+
         if df.height == 0:
             continue
 
-        """df = add_dt_hours(dedup_per_station_validtime(df))
-        if df.height == 0:
-            continue"""
-
         df = df.sort([STATION_ID_COL, "analysistime_dt", "validtime_dt"])
+        df = add_dt_valid_hours(df)
 
-        df= add_dt_valid_hours(df)
         if df.height == 0:
             continue
 
@@ -410,32 +665,12 @@ def prepare_files_once(raw_files):
 
 
 # -------------------------
-# Fit stats (TRAIN only) on prepared files
+# Fit stats
 # -------------------------
+
 def fit_stats_strict_train(prep_files, feats, time_max, sample_per_file, seed):
     """
-    Fits per-feature mean and standard deviation using TRAIN-only data.
-
-    For each prepared parquet file:
-      - keeps only rows with validtime_dt < time_max (i.e., strictly before the split point),
-      - selects only the requested feature columns,
-      - reads at most sample_per_file*5 rows (cheap cap before sampling),
-      - then (if needed) uniformly samples exactly sample_per_file rows without replacement
-        for a consistent per-file contribution.
-
-    Accumulates per-feature counts, sum, and sum-of-squares while ignoring NaNs, and
-    computes:
-      mean = sum / n
-      var  = max(E[x^2] - mean^2, 1e-12)
-      sd   = sqrt(var)
-
-    Safety defaults:
-      - If a feature has no valid samples at all: mean=0.0, sd=1.0
-      - If computed sd becomes 0.0: force sd=1.0 (prevents divide-by-zero in scaling)
-
-    Returns:
-        mu: dict {feature: mean}
-        sd: dict {feature: std_dev}
+    Fit mean/std using train-only data.
     """
     n = {f: 0 for f in feats}
     s1 = {f: 0.0 for f in feats}
@@ -444,62 +679,71 @@ def fit_stats_strict_train(prep_files, feats, time_max, sample_per_file, seed):
     for fp in prep_files:
         lf = (
             pl.scan_parquet(fp)
-              .filter(pl.col("analysistime_dt") < time_max)
-              .select(feats)
-              .head(sample_per_file * 5)
+            .filter(pl.col("analysistime_dt") < time_max)
+            .select(feats)
+            .head(sample_per_file * 5)
         )
+
         df = lf.collect(engine="streaming")
+
         if df.height == 0:
             continue
+
         if df.height > sample_per_file:
             df = df.sample(n=sample_per_file, with_replacement=False, seed=seed)
 
         for f in feats:
             arr = df[f].to_numpy()
             arr = arr[~np.isnan(arr)]
+
             if arr.size:
                 n[f] += arr.size
                 s1[f] += float(arr.sum())
                 s2[f] += float((arr * arr).sum())
 
     mu, sd = {}, {}
+
     for f in feats:
         if n[f] == 0:
             mu[f], sd[f] = 0.0, 1.0
             continue
+
         mean = s1[f] / n[f]
         var = max(s2[f] / n[f] - mean * mean, 1e-12)
+
         mu[f] = float(mean)
         sd[f] = float(np.sqrt(var)) if var > 0 else 1.0
+
         if sd[f] == 0.0:
             sd[f] = 1.0
+
     return mu, sd
 
 
 # -------------------------
-# Dataset on PREP files (no more dedup/sort/dt_hours each epoch)
+# Dataset
 # -------------------------
+
 class PrepStreamSeqDataset(IterableDataset):
     """
-    Iterable, streaming dataset that reads from *prepared* parquet files and yields
-    sequential model inputs without doing per-epoch preprocessing.
-
-    Designed for pipelines where heavy steps (sorting, de-duplication, dt_hours
-    computation) were already baked into PREP files, so training can focus on cheap
-    filtering + normalization.
-
-    Stores:
-      - a time window [time_min, time_max) used later when scanning/filtering rows,
-      - feature column names (feats),
-      - label/aux columns (label_obs, temp_fc) and station id column (sid_col),
-      - sequence length (seq_len),
-      - normalization statistics (mu, sd) for z-scoring,
-      - input dimensionality D = 2*len(feats) + 1:
-          for each feature -> (z-scored value, missingness flag),
-          plus one extra channel for dt_hours.
+    Streaming dataset for prepared parquet files.
     """
-    def __init__(self, files, time_min, time_max, feats, label_obs, temp_fc, sid_col, seq_len, mu, sd):
+
+    def __init__(
+        self,
+        files,
+        time_min,
+        time_max,
+        feats,
+        label_obs,
+        temp_fc,
+        sid_col,
+        seq_len,
+        mu,
+        sd,
+    ):
         super().__init__()
+
         self.files = files
         self.time_min = time_min
         self.time_max = time_max
@@ -513,176 +757,126 @@ class PrepStreamSeqDataset(IterableDataset):
         self.D = 2 * len(feats) + 1
 
     def _transform_block(self, df: pl.DataFrame) -> np.ndarray:
-        """
-        Converts a Polars DataFrame block into a dense float32 design matrix.
+        x = np.empty((df.height, self.D), dtype=np.float32)
 
-        For each feature f in self.feats:
-          - pulls the column to numpy,
-          - builds a missingness mask (NaN -> missing),
-          - creates a z-scored value array where missing values are set to 0,
-          - appends two channels to X:
-              [z_value, missing_flag].
-
-        Then appends dt_hours as the final channel:
-          - reads df["dt_hours"],
-          - replaces NaNs with 0.0,
-          - stores it in X[:, -1].
-
-        Output shape:
-            (num_rows_in_df, D) where D = 2*len(feats) + 1
-        Output dtype:
-            float32
-        """
-        X = np.empty((df.height, self.D), dtype=np.float32)
         k = 0
+
         for f in self.feats:
             col = df[f].to_numpy()
             miss = np.isnan(col)
+
             z = np.zeros_like(col, dtype=np.float32)
+
             if (~miss).any():
-                z[~miss] = ((col[~miss] - self.mu[f]) / self.sd[f]).astype(np.float32, copy=False)
-            X[:, k] = z
-            X[:, k + 1] = miss.astype(np.float32)
+                z[~miss] = ((col[~miss] - self.mu[f]) / self.sd[f]).astype(
+                    np.float32,
+                    copy=False,
+                )
+
+            x[:, k] = z
+            x[:, k + 1] = miss.astype(np.float32)
+
             k += 2
 
         dt = df["dt_valid_hours"].to_numpy()
         dt = np.nan_to_num(dt, nan=0.0).astype(np.float32, copy=False)
-        X[:, -1] = dt
-        return X
+
+        x[:, -1] = dt
+
+        return x
 
     def __iter__(self):
-        """
-        Streams sequences from PREP parquet files and yields (Xseq, y, mask) samples.
-
-        Maintains a per-station rolling buffer (deque) of the most recent feature rows,
-        up to seq_len. As it iterates through time-ordered rows, it uses the *history
-        before the current row* as the model input sequence, and the current row as
-        the target.
-
-        Worker sharding:
-        - If running under a DataLoader with multiple workers, splits the file list so
-            worker k reads every num_workers-th file (files[worker.id::worker.num_workers]).
-        - In single-worker mode, reads all files.
-
-        Per file:
-        - Lazily scans parquet, selecting station id, validtime_dt, dt_hours, features,
-            and the observation label column.
-        - Filters to the configured time window [time_min, time_max).
-        - Drops rows where either the observation label or forecast temperature (temp_fc)
-            is null (ensures the target is computable).
-        - Collects in streaming mode for lower memory overhead.
-        - Transforms the block to a float32 design matrix with z-scores + missing flags
-            + dt_hours via _transform_block().
-        - Builds station ids (sid) and the regression target:
-            y = label_obs - temp_fc  (float32), i.e. forecast error / correction.
-
-        Sample generation (row-by-row):
-        - For station s, fetch its history buffer hist.
-        - If there is at least 1 previous timestep in hist:
-            * stack hist into (T, D)
-            * left-pad with zeros if T < seq_len
-            * create a mask m of length seq_len:
-                0 for padded timesteps, 1 for real timesteps
-            * yield:
-                Xseq: torch.FloatTensor [seq_len, D]
-                y:    torch.FloatTensor scalar (current timestep target)
-                m:    torch.FloatTensor [seq_len] (padding mask)
-        - Finally, append the current timestep’s features to the station history buffer
-            so it becomes available for future targets.
-
-        Notes:
-        - Assumes PREP files are already sorted by (sid, analysistime_dt, validtime_dt); the optional sort
-            is kept commented out as a safety fallback.
-        - The model never “sees” the current timestep features when predicting y[i];
-            it only uses prior history (causal setup).
-        """
         buf = defaultdict(lambda: deque(maxlen=self.seq_len))
 
-        # --- Shard file list across workers ---
         worker = get_worker_info()
+
         if worker is None:
             files = self.files
         else:
-            # Each worker gets every nth file
             files = self.files[worker.id::worker.num_workers]
 
         for fp in files:
             lf = (
                 pl.scan_parquet(fp)
-                .select([self.sid_col, "analysistime_dt", "validtime_dt", "dt_valid_hours", *self.feats, self.label_obs])
-                .filter((pl.col("validtime_dt") >= self.time_min) & (pl.col("validtime_dt") < self.time_max))
-                .filter(pl.col(self.label_obs).is_not_null() & pl.col(self.temp_fc).is_not_null())
+                .select(
+                    [
+                        self.sid_col,
+                        "analysistime_dt",
+                        "validtime_dt",
+                        "dt_valid_hours",
+                        *self.feats,
+                        self.label_obs,
+                    ]
+                )
+                .filter(
+                    (pl.col("validtime_dt") >= self.time_min)
+                    & (pl.col("validtime_dt") < self.time_max)
+                )
+                .filter(
+                    pl.col(self.label_obs).is_not_null()
+                    & pl.col(self.temp_fc).is_not_null()
+                )
             )
 
             df = lf.collect(engine="streaming")
+
             if df.height == 0:
                 continue
 
-            # Already sorted in prep, but keep safe
-            # df = df.sort([self.sid_col, "analysistime_dt", "validtime_dt"])
+            x_block = self._transform_block(df)
 
-            X_block = self._transform_block(df)
             sid = df[self.sid_col].to_numpy()
-            #at_ns = df["analysistime_ns"].to_numpy()
             at = df["analysistime_dt"].to_list()
             y = (df[self.label_obs] - df[self.temp_fc]).to_numpy().astype(np.float32)
 
             for i in range(df.height):
-                # To only use the current forecast to correct that forecast
-                key = (int(sid[i]), at[i])
+                key = (str(sid[i]), at[i])
                 hist = buf[key]
 
                 if len(hist) >= 1:
                     hist_arr = np.stack(hist, axis=0)
+
                     if hist_arr.shape[0] < self.seq_len:
                         pad = self.seq_len - hist_arr.shape[0]
-                        Xseq = np.vstack([np.zeros((pad, self.D), np.float32), hist_arr])
+
+                        xseq = np.vstack(
+                            [
+                                np.zeros((pad, self.D), np.float32),
+                                hist_arr,
+                            ]
+                        )
+
                         m = np.concatenate(
-                            [np.zeros(pad, np.float32), np.ones(hist_arr.shape[0], np.float32)]
+                            [
+                                np.zeros(pad, np.float32),
+                                np.ones(hist_arr.shape[0], np.float32),
+                            ]
                         ).astype(np.float32)
+
                     else:
-                        Xseq = hist_arr[-self.seq_len:]
+                        xseq = hist_arr[-self.seq_len:]
                         m = np.ones(self.seq_len, np.float32)
 
-                    yield torch.from_numpy(Xseq), torch.tensor(y[i], dtype=torch.float32), torch.from_numpy(m)
+                    yield (
+                        torch.from_numpy(xseq),
+                        torch.tensor(y[i], dtype=torch.float32),
+                        torch.from_numpy(m),
+                    )
 
-                hist.append(X_block[i])
-
+                hist.append(x_block[i])
 
 
 def collate_batch(batch):
-    """
-    Custom DataLoader collate function for sequence samples.
+    x, y, m = zip(*batch)
 
-    Takes a list of dataset items produced by the IterableDataset, where each item is:
-    (Xseq, y, mask)
-
-    Unzips the list into separate tuples (X, y, m) and stacks each along the new
-    batch dimension (dim=0), producing:
-
-      - X: [B, seq_len, D]   batched input sequences
-      - y: [B] (or [B, 1])   batched targets, depending on how y was created upstream
-      - m: [B, seq_len]      batched padding masks (0 = pad, 1 = real)
-
-    Returns:
-        (X_batch, y_batch, m_batch) as torch tensors ready for model forward pass.
-    """
-    X, y, m = zip(*batch)
-    return torch.stack(X, 0), torch.stack(y, 0), torch.stack(m, 0)
+    return torch.stack(x, 0), torch.stack(y, 0), torch.stack(m, 0)
 
 
 class ThreadPrefetcher:
     """
-    Wrap an iterable loader and prefetch items in a background thread.
-
-    Items from `loader` are read asynchronously and stored in a bounded
-    queue so the consumer can retrieve already-prepared batches while the
-    next ones are being loaded.
-
-    Args:
-        loader: Iterable producing batches.
-        max_prefetch: Maximum number of prefetched batches to buffer.
+    Wrap iterable loader and prefetch batches in a background thread.
     """
+
     def __init__(self, loader, max_prefetch=8):
         self.loader = loader
         self.q = queue.Queue(maxsize=max_prefetch)
@@ -703,36 +897,25 @@ class ThreadPrefetcher:
 
         while True:
             batch = self.q.get()
+
             if batch is self._stop:
                 break
+
             yield batch
+
 
 # -------------------------
 # Model
 # -------------------------
+
 class BiasLSTM(nn.Module):
     """
-    Sequence-to-scalar LSTM model for predicting a bias/correction from past context.
-
-    Architecture:
-      - An LSTM encoder that processes an input sequence x of shape [B, T, in_dim],
-        producing hidden states out of shape [B, T, hidden].
-      - A small MLP "head" that maps the selected last valid hidden state to a single
-        scalar output per sample (shape [B]).
-
-    Padding handling:
-      - Expects an optional pad_mask of shape [B, T] with 1 for real timesteps and
-        0 for left-padding (as produced by the dataset).
-      - Computes each sample’s effective sequence length as sum(pad_mask).
-      - Selects the hidden state at the last real timestep (length-1) using gather(),
-        so predictions are based on the most recent available history, not padded zeros.
-
-    Notes:
-      - LSTM uses dropout only when num_layers > 1 (PyTorch LSTM behavior).
-      - Output is a single regression value per batch item (squeezed to [B]).
+    Sequence-to-scalar LSTM model for bias prediction.
     """
+
     def __init__(self, in_dim, hidden=128, num_layers=2, dropout=0.2):
         super().__init__()
+
         self.lstm = nn.LSTM(
             input_size=in_dim,
             hidden_size=hidden,
@@ -740,6 +923,7 @@ class BiasLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
+
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -749,51 +933,39 @@ class BiasLSTM(nn.Module):
 
     def forward(self, x, pad_mask=None):
         out, _ = self.lstm(x)
+
         lengths = pad_mask.sum(dim=1).clamp(min=1).long()
         idx = (lengths - 1).view(-1, 1, 1).expand(-1, 1, out.size(-1))
+
         last = out.gather(1, idx).squeeze(1)
+
         return self.head(last).squeeze(-1)
 
 
 # -------------------------
 # Train / eval
 # -------------------------
+
 def global_rmse_from_loader(model, loader, device, max_steps=None):
-    """
-    Evaluates a model on a DataLoader and returns global RMSE over all seen samples.
-
-    Runs the model in eval mode with gradients disabled, iterating batches from `loader`.
-    For each batch:
-      - moves inputs/targets/masks to `device`,
-      - computes predictions with padding-aware forward pass (model(X, m)),
-      - accumulates total squared error (sum over all elements),
-      - accumulates total sample count.
-
-    Supports early stopping via `max_steps` to limit the number of batches processed
-    (useful for quick validation checks or debugging).
-
-    Returns:
-        rmse = sqrt( sum((pred - y)^2) / (N + 1e-8) )
-
-    Notes:
-      - Uses a small epsilon in the denominator to avoid divide-by-zero if N=0.
-      - This computes a *global* RMSE (not averaged per-batch).
-    """
     model.eval()
+
     se = 0.0
     n = 0
     steps = 0
+
     with torch.no_grad():
-        for X, y, m in loader:
-            X = X.to(device, non_blocking=True)
+        for x, y, m in loader:
+            x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             m = m.to(device, non_blocking=True)
 
-            pred = model(X, m)
+            pred = model(x, m)
+
             se += ((pred - y) ** 2).sum().item()
             n += y.numel()
 
             steps += 1
+
             if max_steps is not None and steps >= max_steps:
                 break
 
@@ -801,56 +973,30 @@ def global_rmse_from_loader(model, loader, device, max_steps=None):
 
 
 def train_epoch_amp(model, loader, opt, device, grad_clip=2.0, max_steps=None):
-    """
-    Trains the model for one epoch using (optional) CUDA automatic mixed precision (AMP).
-
-    Runs the model in train mode and iterates batches from `loader`. For each batch:
-      - moves data to `device`,
-      - clears gradients (set_to_none=True is a small performance win),
-      - computes predictions and MSE loss under autocast when on CUDA,
-      - backpropagates using GradScaler to prevent FP16 underflow,
-      - optionally clips gradient norm to `grad_clip`,
-      - performs optimizer step via the scaler and updates scaling factor.
-
-    Also accumulates a global RMSE over the processed batches (using the same global
-    sum-of-squared-error / count logic as evaluation).
-
-    Args:
-        model: torch.nn.Module
-        loader: DataLoader yielding (X, y, m)
-        opt: optimizer (e.g., Adam)
-        device: "cuda" or "cpu"
-        grad_clip: if > 0, clips global grad norm to this value (stabilizes training)
-        max_steps: optional cap on number of batches processed
-
-    Returns:
-        rmse = sqrt( sum((pred - y)^2) / (N + 1e-8) )
-
-    Notes:
-      - AMP is enabled only when device == "cuda"; on CPU it behaves like standard FP32.
-      - RMSE is computed from predictions produced *during training mode* (dropout on),
-        so it may be slightly noisier than eval RMSE.
-    """
     model.train()
+
     scaler = torch.amp.GradScaler(enabled=(device == "cuda"))
 
     se = 0.0
     n = 0
     steps = 0
 
-    for X, y, m in loader:
-        X = X.to(device, non_blocking=True)
+    for x, y, m in loader:
+        x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         m = m.to(device, non_blocking=True)
 
         opt.zero_grad(set_to_none=True)
+
         with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
-            pred = model(X, m)
+            pred = model(x, m)
             loss = ((pred - y) ** 2).mean()
 
         scaler.scale(loss).backward()
+
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
         scaler.step(opt)
         scaler.update()
 
@@ -858,6 +1004,7 @@ def train_epoch_amp(model, loader, opt, device, grad_clip=2.0, max_steps=None):
         n += y.numel()
 
         steps += 1
+
         if max_steps is not None and steps >= max_steps:
             break
 
@@ -865,252 +1012,97 @@ def train_epoch_amp(model, loader, opt, device, grad_clip=2.0, max_steps=None):
 
 
 def make_run_dir():
-    """
-    Creates and returns a new timestamped directory for storing a training run’s outputs.
-
-    Builds a folder name like:
-        optuna_lstm_YYYYMMDD_HHMMSS
-    under the base path MODEL_DIR, using the current time from pl.datetime_now().
-
-    Ensures the directory exists (creates parent directories as needed) and returns
-    the resulting Path object, so callers can save checkpoints, logs, Optuna trials,
-    and config artifacts in a unique per-run location.
-    """
-    run_dir = MODEL_DIR / f"optuna_lstm_{pl.datetime_now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = MODEL_DIR / f"bias_lstm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
     return run_dir
-
-
-def objective_cv(trial, prep_files, folds, mu, sd, ctx):
-    """
-    Optuna objective for time-based cross-validation over PREP files.
-
-    Samples a set of LSTM + optimizer hyperparameters from `trial`, then evaluates
-    them across multiple temporal folds. Each fold trains on all data strictly
-    before the fold’s validation window, and validates on a contiguous time window.
-
-    Hyperparameters tuned (search space):
-      - hidden:       LSTM hidden size (categorical list)
-      - num_layers:   number of stacked LSTM layers (1..3)
-      - dropout:      dropout used in LSTM (between layers) and in the MLP head
-      - lr:           AdamW learning rate (log-uniform)
-      - wd:           AdamW weight decay (log-uniform)
-      - grad_clip:    gradient norm clipping threshold
-
-    Data / folds:
-      - `folds` is an iterable of tuples like: (train_end, val_start, val_end)
-        (train_end is not used directly here; training is defined as < val_start).
-      - For each fold:
-          * Training dataset:  time_min=1900-01-01, time_max=val_start
-          * Validation dataset: time_min=val_start, time_max=val_end
-        Both datasets read from the same PREP parquet files and use the same
-        normalization stats (mu, sd).
-
-    DataLoader setup:
-      - IterableDataset => shuffle=False
-      - num_workers/persistent_workers/prefetch_factor control parallel reading
-      - pin_memory enabled on CUDA for faster host->device transfer
-      - multiprocessing_context `ctx` is passed explicitly for worker start method
-
-    Training loop (per fold):
-      - Builds a fresh BiasLSTM + AdamW optimizer.
-      - Repeats for up to TRIAL_MAX_EPOCHS:
-          * trains for one epoch using AMP (train_epoch_amp),
-            optionally limiting work via TRIAL_STEPS_PER_EPOCH
-          * evaluates global RMSE on validation loader (global_rmse_from_loader),
-            also step-limited
-          * tracks best validation RMSE and applies early stopping:
-              - improvement must exceed MIN_DELTA
-              - stop after TRIAL_PATIENCE non-improving epochs
-
-    Optuna reporting / pruning:
-      - trial.report(best_val, step=global_step) reports intermediate best RMSE
-        so Optuna can plot learning curves and make pruning decisions.
-      - trial.should_prune() triggers pruning via raising TrialPruned.
-
-    Cleanup:
-      - Ensures model, optimizer, loaders, and datasets are deleted each fold,
-        calls gc.collect(), and empties CUDA cache to reduce GPU memory buildup
-        across folds/trials.
-
-    Objective value:
-      - Returns the mean of the best validation RMSE from each fold:
-          mean(best_val_fold_0, best_val_fold_1, ...)
-      - Optuna will try to minimize this returned float.
-    """
-    hidden     = trial.suggest_categorical("hidden", [160, 192, 256])
-    num_layers = trial.suggest_int("num_layers", 1, 1)
-    dropout    = trial.suggest_float("dropout", 0.0, 0.4)
-    lr         = trial.suggest_float("lr", 5e-5, 1e-3, log=True)
-    wd         = trial.suggest_float("wd", 1e-6, 5e-3, log=True)
-    grad_clip  = trial.suggest_float("grad_clip", 0.5, 5.0)
-    seq_len = trial.suggest_int("seq_len", 5, 24)
-
-    in_dim = 2 * len(FEATS) + 1
-    fold_bests = []
-    global_step = 0
-
-    for fold_id, (train_end, val_start, val_end) in enumerate(folds):
-        ds_tr = PrepStreamSeqDataset(
-            files=prep_files,
-            time_min=pl.datetime(1900, 1, 1),
-            time_max=train_end,
-            feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=seq_len,
-            mu=mu, sd=sd,
-        )
-        ds_va = PrepStreamSeqDataset(
-            files=prep_files,
-            time_min=val_start,
-            time_max=val_end,
-            feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=seq_len,
-            mu=mu, sd=sd,
-        )
-
-        dl_tr = DataLoader(
-            ds_tr, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS_OPTUNA, collate_fn=collate_batch,
-            pin_memory=(DEVICE == "cuda"),
-            persistent_workers=(NUM_WORKERS_OPTUNA > 0),
-            prefetch_factor=PREFETCH_FINAL if NUM_WORKERS_OPTUNA > 0 else 2,
-            multiprocessing_context=ctx,
-        )
-        dl_va = DataLoader(
-            ds_va, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS_OPTUNA, collate_fn=collate_batch,
-            pin_memory=(DEVICE == "cuda"),
-            persistent_workers=(NUM_WORKERS_OPTUNA > 0),
-            prefetch_factor=PREFETCH_FINAL if NUM_WORKERS_OPTUNA > 0 else 2,
-            multiprocessing_context=ctx,
-        )
-
-        dl_tr = ThreadPrefetcher(dl_tr, max_prefetch=8)
-        dl_va = ThreadPrefetcher(dl_va, max_prefetch=4)
-
-        model = BiasLSTM(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout).to(DEVICE)
-        opt = AdamW(model.parameters(), lr=lr, weight_decay=wd)
-
-        best_val = float("inf")
-        bad = 0
-
-        try:
-            for ep in range(TRIAL_MAX_EPOCHS):
-                _ = train_epoch_amp(
-                    model, dl_tr, opt, DEVICE,
-                    grad_clip=grad_clip,
-                    max_steps=TRIAL_STEPS_PER_EPOCH
-                )
-                val_rmse = global_rmse_from_loader(
-                    model, dl_va, DEVICE,
-                    max_steps=TRIAL_STEPS_PER_EPOCH
-                )
-
-                print(f"[trial {trial.number:03d}] fold {fold_id} ep {ep:02d} val_rmse={val_rmse:.4f}")
-
-                if val_rmse < best_val - MIN_DELTA:
-                    best_val = val_rmse
-                    bad = 0
-                else:
-                    bad += 1
-                    if bad >= TRIAL_PATIENCE:
-                        break
-
-                trial.report(best_val, step=global_step)
-                global_step += 1
-                if trial.should_prune():
-                    raise TrialPruned()
-
-        finally:
-            del model, opt, dl_tr, dl_va, ds_tr, ds_va
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        fold_bests.append(best_val)
-
-    return float(np.mean(fold_bests))
-
-
-
-def run_optuna_and_save(prep_files, val_start, test_start, mu, sd, out_dir: Path):
-    """
-    Runs Optuna hyperparameter search and saves the resulting study + best parameters.
-
-    Creates an Optuna study configured to minimize the cross-validation objective:
-      - Sampler: TPESampler with a fixed seed for reproducible suggestions.
-      - Pruner:  MedianPruner (with warmup) to stop underperforming trials early.
-
-    Optimization:
-      - Calls study.optimize(...) for N_TRIALS trials.
-      - Uses a lambda wrapper to pass fixed arguments into objective_cv.
-        (The objective is expected to return a validation RMSE-like scalar to minimize.)
-      - Enables gc_after_trial to encourage cleanup between trials.
-
-    Persistence / artifacts:
-      - Saves the full Optuna Study object to `optuna_study.pkl` (pickle) so you can
-        later inspect trials, plots, and parameter importance without rerunning.
-      - Extracts the best trial parameters (study.best_params) and augments them with:
-          * best_value_val_rmse: the best objective value found
-          * trial_steps_per_epoch: the step cap used during tuning
-          * trial_max_epochs: the max epochs used during tuning
-        and writes them to `best_params.json` for easy reproducibility.
-
-    Side effects:
-      - Prints the best value and parameters to stdout.
-      - Assumes `out_dir` exists (or is created upstream) and is writable.
-
-    Returns:
-        best_params: dict containing best hyperparameters + metadata for the tuning run.
-    """
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=SEED),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=3),
-    )
-
-    study.optimize(
-        lambda t: objective_cv(t, prep_files, val_start, test_start, mu, sd),
-        n_trials=N_TRIALS,
-        gc_after_trial=True,
-    )
-
-    # --- save study + best params BEFORE final training ---
-    with open(out_dir / "optuna_study.pkl", "wb") as f:
-        pickle.dump(study, f)
-
-    best_params = dict(study.best_params)
-    best_params["best_value_val_rmse"] = float(study.best_value)
-    best_params["trial_steps_per_epoch"] = TRIAL_STEPS_PER_EPOCH
-    best_params["trial_max_epochs"] = TRIAL_MAX_EPOCHS
-
-    with open(out_dir / "best_params.json", "w") as f:
-        json.dump(best_params, f, indent=2)
-
-    print("Optuna best:", study.best_value, study.best_params)
-    print("Saved Optuna artifacts to:", out_dir)
-
-    return best_params
-
-
 
 
 # -------------------------
 # Main
 # -------------------------
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--prepare", action="store_true", help="Create prepared parquet files (one-time).")
-    args = parser.parse_args()
+    global DEVICE, SEED
+    global RAW_GLOB, PREP_DIR, PREP_GLOB
+    global MODEL_DIR, MODEL_TAG, MODEL_PATH, STATS_PATH
+    global RUN_OPTUNA
+    global BATCH_SIZE, MAX_EPOCHS, PATIENCE, MIN_DELTA, LR, WD
+    global N_TRIALS, TRIAL_STEPS_PER_EPOCH, TRIAL_MAX_EPOCHS, TRIAL_PATIENCE
+    global FINAL_STEPS_PER_EPOCH, FINAL_VAL_STEPS
+    global TEST_DAYS, VAL_DAYS_FINAL, N_FOLDS
+    global STATS_SAMPLE_PER_FILE
+    global NUM_WORKERS_OPTUNA, PREFETCH_FINAL, NUM_WORKERS_FINAL
+    global MAX_LEAD_HOURS, EMBARGO_TD
+
+    args = parse_args()
+
+    SEED = args.seed
+    set_seed(SEED)
+
+    if args.device == "auto":
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        DEVICE = args.device
+
+    RAW_GLOB = resolve_glob(args.raw_input, "ml_data_full_*.parquet")
+
+    PREP_DIR = Path(args.prep_dir)
+    PREP_DIR.mkdir(parents=True, exist_ok=True)
+    PREP_GLOB = PREP_DIR / "ml_data_prep_*.parquet"
+
+    MODEL_DIR = Path(args.model_dir)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    MODEL_TAG = args.model_tag
+    MODEL_PATH = MODEL_DIR / f"{MODEL_TAG}.pt"
+    STATS_PATH = MODEL_DIR / f"{MODEL_TAG}_stats.json"
+
+    RUN_OPTUNA = args.run_optuna
+
+    BATCH_SIZE = args.batch_size
+    MAX_EPOCHS = args.max_epochs
+    PATIENCE = args.patience
+    MIN_DELTA = args.min_delta
+    LR = args.lr
+    WD = args.wd
+
+    N_TRIALS = args.n_trials
+    TRIAL_STEPS_PER_EPOCH = args.trial_steps_per_epoch
+    TRIAL_MAX_EPOCHS = args.trial_max_epochs
+    TRIAL_PATIENCE = args.trial_patience
+
+    FINAL_STEPS_PER_EPOCH = args.final_steps_per_epoch
+    FINAL_VAL_STEPS = args.final_val_steps
+
+    TEST_DAYS = args.test_days
+    VAL_DAYS_FINAL = args.val_days_final
+    N_FOLDS = args.n_folds
+
+    STATS_SAMPLE_PER_FILE = args.stats_sample_per_file
+
+    NUM_WORKERS_OPTUNA = args.num_workers_optuna
+    PREFETCH_FINAL = args.prefetch_final
+    NUM_WORKERS_FINAL = args.num_workers_final
+
+    MAX_LEAD_HOURS = args.max_lead_hours
+    EMBARGO_TD = timedelta(hours=MAX_LEAD_HOURS)
+
+    print(f"[INFO] Device: {DEVICE}")
+    print(f"[INFO] Raw input: {RAW_GLOB}")
+    print(f"[INFO] Prepared dir: {PREP_DIR}")
+    print(f"[INFO] Model dir: {MODEL_DIR}")
+    print(f"[INFO] Model tag: {MODEL_TAG}")
+    print(f"[INFO] Run Optuna: {RUN_OPTUNA}")
 
     raw_files = list_files(RAW_GLOB)
     _set_mp_spawn()
 
     # ------------------------------------------------------------
-    # 0) PREPARE step (one-time)
+    # 0) Prepare step
     # ------------------------------------------------------------
     if args.prepare:
-        print("Preparing parquet files (dedup + dt_hours + sort)...")
+        print("Preparing parquet files...")
         prepare_files_once(raw_files)
         print("Done. Prepared files in:", PREP_DIR)
         return
@@ -1120,20 +1112,20 @@ def main():
     # ------------------------------------------------------------
     # 1) Create run directory
     # ------------------------------------------------------------
-    run_name = datetime.now().strftime("bias_lstm_%Y%m%d_%H%M%S")
-    run_dir = MODEL_DIR / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir()
     print("Run dir:", run_dir)
 
     # ------------------------------------------------------------
-    # 2) Rolling CV folds (Optuna) + final holdout split
+    # 2) Rolling CV folds + final split
     # ------------------------------------------------------------
     folds, test_start = split_trainval_test_rolling_from_files(
         prep_files,
         test_days=TEST_DAYS,
         n_folds=N_FOLDS,
         train_start_dt=None,
+        embargo_td=EMBARGO_TD,
     )
+
     val_start_final, val_end_final, test_start = split_final_train_val_test_from_max(
         prep_files,
         test_days=TEST_DAYS,
@@ -1149,9 +1141,10 @@ def main():
     print("  embargo        :", EMBARGO_TD)
 
     # ------------------------------------------------------------
-    # 3) Fit normalization stats (TRAIN ONLY for final training) + save
+    # 3) Fit normalization stats
     # ------------------------------------------------------------
-    print("Fitting normalization stats on a sample of TRAIN data (bounded RAM)...")
+    print("Fitting normalization stats on train data sample...")
+
     mu, sd = fit_stats_strict_train(
         prep_files=prep_files,
         feats=FEATS,
@@ -1159,16 +1152,19 @@ def main():
         sample_per_file=STATS_SAMPLE_PER_FILE,
         seed=SEED,
     )
-    stats_path = run_dir / "bias_lstm_stream_stats.json"
+
+    stats_path = run_dir / f"{MODEL_TAG}_stats.json"
+
     with open(stats_path, "w") as f:
         json.dump({"mu": mu, "sd": sd}, f)
+
     print("Saved stats to:", stats_path)
 
     in_dim = 2 * len(FEATS) + 1
     print("LSTM input dim:", in_dim)
 
     # ------------------------------------------------------------
-    # 4) Loader factory (supports per-call num_workers for Optuna stability)
+    # 4) Loader factory
     # ------------------------------------------------------------
     def make_loaders(
         batch_size: int,
@@ -1177,41 +1173,55 @@ def main():
         val_end,
         seq_len,
         test_start=None,
-        num_workers: int = NUM_WORKERS_FINAL,
-        prefetch_factor: int = PREFETCH_FINAL,
+        num_workers: int = None,
+        prefetch_factor: int = None,
     ):
-        """
-        train: [1900 .. train_end)
-        val:   [val_start .. val_end)
-        test:  [test_start .. 2200)   (optional)
-        """
+        if num_workers is None:
+            num_workers = NUM_WORKERS_FINAL
+
+        if prefetch_factor is None:
+            prefetch_factor = PREFETCH_FINAL
 
         ds_tr = PrepStreamSeqDataset(
             files=prep_files,
             time_min=pl.datetime(1900, 1, 1),
             time_max=train_end,
-            feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=seq_len,
-            mu=mu, sd=sd,
+            feats=FEATS,
+            label_obs=LABEL_OBS,
+            temp_fc=TEMP_FC,
+            sid_col=STATION_ID_COL,
+            seq_len=seq_len,
+            mu=mu,
+            sd=sd,
         )
+
         ds_va = PrepStreamSeqDataset(
             files=prep_files,
             time_min=val_start,
             time_max=val_end,
-            feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-            sid_col=STATION_ID_COL, seq_len=seq_len,
-            mu=mu, sd=sd,
+            feats=FEATS,
+            label_obs=LABEL_OBS,
+            temp_fc=TEMP_FC,
+            sid_col=STATION_ID_COL,
+            seq_len=seq_len,
+            mu=mu,
+            sd=sd,
         )
 
         ds_ts = None
+
         if test_start is not None:
             ds_ts = PrepStreamSeqDataset(
                 files=prep_files,
                 time_min=test_start,
                 time_max=pl.datetime(2200, 1, 1),
-                feats=FEATS, label_obs=LABEL_OBS, temp_fc=TEMP_FC,
-                sid_col=STATION_ID_COL, seq_len=seq_len,
-                mu=mu, sd=sd,
+                feats=FEATS,
+                label_obs=LABEL_OBS,
+                temp_fc=TEMP_FC,
+                sid_col=STATION_ID_COL,
+                seq_len=seq_len,
+                mu=mu,
+                sd=sd,
             )
 
         loader_kwargs = dict(
@@ -1222,7 +1232,6 @@ def main():
             num_workers=num_workers,
         )
 
-        # only legal when multiprocessing is enabled
         if num_workers > 0:
             loader_kwargs.update(
                 persistent_workers=True,
@@ -1234,16 +1243,14 @@ def main():
         dl_va = DataLoader(ds_va, **loader_kwargs)
 
         dl_ts = None
+
         if ds_ts is not None:
             dl_ts = DataLoader(ds_ts, **loader_kwargs)
 
         return dl_tr, dl_va, dl_ts
 
-
-
     # ------------------------------------------------------------
-    # 5) Optuna with rolling CV
-    #    IMPORTANT: use num_workers=0 in Optuna to avoid worker abort/reset issues
+    # 5) Optuna
     # ------------------------------------------------------------
     best_params = None
 
@@ -1262,7 +1269,6 @@ def main():
             global_step = 0
 
             for fold_id, (train_end, vs, ve) in enumerate(folds):
-                # num_workers=0 => stable Optuna trials
                 dl_tr, dl_va, _ = make_loaders(
                     bs,
                     train_end=train_end,
@@ -1270,11 +1276,16 @@ def main():
                     val_end=ve,
                     num_workers=NUM_WORKERS_OPTUNA,
                     prefetch_factor=PREFETCH_FINAL,
-                    seq_len=seq_len
+                    seq_len=seq_len,
                 )
 
+                model = BiasLSTM(
+                    in_dim=in_dim,
+                    hidden=hidden,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                ).to(DEVICE)
 
-                model = BiasLSTM(in_dim=in_dim, hidden=hidden, num_layers=num_layers, dropout=dropout).to(DEVICE)
                 opt = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
                 best_val = float("inf")
@@ -1283,34 +1294,46 @@ def main():
                 try:
                     for ep in range(TRIAL_MAX_EPOCHS):
                         _ = train_epoch_amp(
-                            model, dl_tr, opt, DEVICE,
+                            model,
+                            dl_tr,
+                            opt,
+                            DEVICE,
                             grad_clip=grad_clip,
-                            max_steps=TRIAL_STEPS_PER_EPOCH
-                        )
-                        va_rmse = global_rmse_from_loader(
-                            model, dl_va, DEVICE,
-                            max_steps=TRIAL_STEPS_PER_EPOCH
+                            max_steps=TRIAL_STEPS_PER_EPOCH,
                         )
 
-                        # print epochs (what you asked for)
-                        print(f"[trial {trial.number:03d}] fold {fold_id} ep {ep:02d} val_rmse={va_rmse:.4f}")
+                        va_rmse = global_rmse_from_loader(
+                            model,
+                            dl_va,
+                            DEVICE,
+                            max_steps=TRIAL_STEPS_PER_EPOCH,
+                        )
+
+                        print(
+                            f"[trial {trial.number:03d}] "
+                            f"fold {fold_id} ep {ep:02d} "
+                            f"val_rmse={va_rmse:.4f}"
+                        )
 
                         if va_rmse < best_val - MIN_DELTA:
                             best_val = va_rmse
                             bad = 0
                         else:
                             bad += 1
+
                             if bad >= TRIAL_PATIENCE:
                                 break
 
                         trial.report(best_val, step=global_step)
                         global_step += 1
+
                         if trial.should_prune():
                             raise TrialPruned()
 
                 finally:
                     del model, opt, dl_tr, dl_va
                     gc.collect()
+
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
@@ -1323,20 +1346,31 @@ def main():
             sampler=optuna.samplers.TPESampler(seed=SEED),
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=3),
         )
+
         study.optimize(objective, n_trials=N_TRIALS, gc_after_trial=True)
 
         best_params = dict(study.best_params)
-        print("Optuna best value (mean CV val RMSE):", study.best_value)
+
+        print("Optuna best value mean CV val RMSE:", study.best_value)
         print("Optuna best params:", best_params)
 
         with open(run_dir / "best_params.json", "w") as f:
-            json.dump({"best_value": float(study.best_value), "best_params": best_params}, f, indent=2)
+            json.dump(
+                {
+                    "best_value": float(study.best_value),
+                    "best_params": best_params,
+                },
+                f,
+                indent=2,
+            )
+
         with open(run_dir / "optuna_study.pkl", "wb") as f:
             pickle.dump(study, f)
+
         print("Saved Optuna artifacts to:", run_dir)
 
     # ------------------------------------------------------------
-    # 6) Choose final hyperparameters (Optuna or defaults)
+    # 6) Choose final hyperparameters
     # ------------------------------------------------------------
     if best_params is not None:
         final_hidden = int(best_params["hidden"])
@@ -1347,6 +1381,25 @@ def main():
         final_clip = float(best_params["grad_clip"])
         final_bs = int(best_params["batch_size"])
         final_seq_len = int(best_params["seq_len"])
+
+    elif args.fixed_params_json is not None:
+        fixed_params_path = Path(args.fixed_params_json)
+
+        if not fixed_params_path.exists():
+            raise FileNotFoundError(f"Fixed params JSON not found: {fixed_params_path}")
+
+        with open(fixed_params_path, "r") as f:
+            fixed_params = json.load(f)
+
+        final_hidden = int(fixed_params["hidden"])
+        final_layers = int(fixed_params.get("num_layers", 1))
+        final_dropout = float(fixed_params["dropout"])
+        final_lr = float(fixed_params["lr"])
+        final_wd = float(fixed_params["wd"])
+        final_clip = float(fixed_params["grad_clip"])
+        final_bs = int(fixed_params.get("batch_size", BATCH_SIZE))
+        final_seq_len = int(fixed_params["seq_len"])
+
     else:
         final_hidden = 192
         final_layers = 1
@@ -1360,6 +1413,7 @@ def main():
     with open(run_dir / "final_training_config.json", "w") as f:
         json.dump(
             {
+                "model_tag": MODEL_TAG,
                 "seq_len": final_seq_len,
                 "batch_size": final_bs,
                 "hidden": final_hidden,
@@ -1388,23 +1442,30 @@ def main():
             f,
             indent=2,
         )
+
     print("Saved final training config to:", run_dir / "final_training_config.json")
 
     # ------------------------------------------------------------
-    # 7) FINAL training (full, real early stopping)
+    # 7) Final training
     # ------------------------------------------------------------
     dl_tr, dl_va, dl_ts = make_loaders(
         final_bs,
-        train_end=val_start_final,     # train: < val_start_final
-        val_start=val_start_final,     # val:   [val_start_final, val_end_final)
+        train_end=val_start_final,
+        val_start=val_start_final,
         val_end=val_end_final,
-        test_start=test_start,         # test:  [test_start, ...)
+        test_start=test_start,
         num_workers=NUM_WORKERS_FINAL,
         prefetch_factor=PREFETCH_FINAL,
         seq_len=final_seq_len,
     )
 
-    model = BiasLSTM(in_dim=in_dim, hidden=final_hidden, num_layers=final_layers, dropout=final_dropout).to(DEVICE)
+    model = BiasLSTM(
+        in_dim=in_dim,
+        hidden=final_hidden,
+        num_layers=final_layers,
+        dropout=final_dropout,
+    ).to(DEVICE)
+
     opt = AdamW(model.parameters(), lr=final_lr, weight_decay=final_wd)
 
     best_val = float("inf")
@@ -1412,16 +1473,35 @@ def main():
     best_state = None
 
     for ep in range(MAX_EPOCHS):
-        tr_rmse = train_epoch_amp(model, dl_tr, opt, DEVICE, grad_clip=final_clip, max_steps=FINAL_STEPS_PER_EPOCH)
-        va_rmse = global_rmse_from_loader(model, dl_va, DEVICE, max_steps=FINAL_VAL_STEPS)
+        tr_rmse = train_epoch_amp(
+            model,
+            dl_tr,
+            opt,
+            DEVICE,
+            grad_clip=final_clip,
+            max_steps=FINAL_STEPS_PER_EPOCH,
+        )
+
+        va_rmse = global_rmse_from_loader(
+            model,
+            dl_va,
+            DEVICE,
+            max_steps=FINAL_VAL_STEPS,
+        )
+
         print(f"Epoch {ep:03d}: train_rmse={tr_rmse:.4f} val_rmse={va_rmse:.4f}")
 
         if va_rmse < best_val - MIN_DELTA:
             best_val = va_rmse
             bad = 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
         else:
             bad += 1
+
             if bad >= PATIENCE:
                 print(f"Early stop at ep={ep:03d}, best_val_rmse={best_val:.4f}")
                 break
@@ -1432,18 +1512,28 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    model_path = run_dir / "bias_lstm_stream.pt"
+    model_path = run_dir / f"{MODEL_TAG}.pt"
     torch.save(model.state_dict(), model_path)
+
     print("Saved model weights to:", model_path)
 
     ts_rmse_bias = global_rmse_from_loader(model, dl_ts, DEVICE)
-    print(f"\nTEST global RMSE on bias (obs-fc): {ts_rmse_bias:.4f}")
+
+    print(f"\nTEST global RMSE on bias obs-fc: {ts_rmse_bias:.4f}")
 
     with open(run_dir / "results.json", "w") as f:
-        json.dump({"best_val_rmse": float(best_val), "test_rmse_bias": float(ts_rmse_bias)}, f, indent=2)
+        json.dump(
+            {
+                "best_val_rmse": float(best_val),
+                "test_rmse_bias": float(ts_rmse_bias),
+            },
+            f,
+            indent=2,
+        )
+
     print("Saved results to:", run_dir / "results.json")
+    print("[DONE] Run directory:", run_dir)
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,7 +1,8 @@
-import os
-from pathlib import Path
+import argparse
 import calendar
 from datetime import datetime
+from pathlib import Path
+
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -10,537 +11,964 @@ from matplotlib.colors import LogNorm
 from matplotlib.ticker import LogLocator
 
 
-# User settings
-ML_TAG = "tuned_ah_2019"
-ML_NAME = "EC_ML_XGBoost_2019"
-
-SHOW_PLOT = False
-SAVE_PLOT = True
-FIG_DPI   = 150
-
-
-# Directories
-HOME     = Path.home()
-STATION_FILE = HOME / "thesis_project" / "data" / "stations.csv"
-METRICS  = HOME / "thesis_project" / "metrics" 
-MOS_DIR  = METRICS / "mos"
-ML_DIR   = METRICS / "2019_tuned_ah"
-OUT_DIR  = HOME / "thesis_project" / "figures" / "MOSvsML_timeseries" / "north-Finland" / "ldt48"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
+# =========================
 # Columns
+# =========================
+
 SPLIT = "analysistime"
-KEYS  = [SPLIT, "validtime", "leadtime"]
-OBS   = "obs_TA"
-RAW   = "raw_fc"
-MOS   = "corrected_mos"
-MLCOL = f"corrected_{ML_TAG}"
+KEYS = [SPLIT, "validtime", "leadtime"]
 
-SEASONAL = False
+OBS = "obs_TA"
+RAW = "raw_fc"
+MOS = "corrected_mos"
 
 
-LEADTIME = 48
+# =========================
+# Argument parsing
+# =========================
 
-#---------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create MOS vs ML scatter-density plots for temperature predictions, "
+            "optionally filtered by station subset, month windows, seasons, and leadtime."
+        )
+    )
+
+    parser.add_argument(
+        "--mos-dir",
+        required=True,
+        type=str,
+        help="Directory containing MOS evaluation parquet files.",
+    )
+
+    parser.add_argument(
+        "--ml-dir",
+        required=True,
+        type=str,
+        help="Directory containing ML evaluation parquet files.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=str,
+        help="Directory where figures will be saved.",
+    )
+
+    parser.add_argument(
+        "--ml-tag",
+        default="tuned_ah_2019",
+        type=str,
+        help=(
+            "ML model tag used in filenames and corrected_<ml-tag> column. "
+            "Default: tuned_ah_2019."
+        ),
+    )
+
+    parser.add_argument(
+        "--ml-name",
+        default="EC_ML_XGBoost_2019",
+        type=str,
+        help="Readable ML model name used in plot labels. Default: EC_ML_XGBoost_2019.",
+    )
+
+    parser.add_argument(
+        "--leadtime",
+        default=48,
+        type=int,
+        help="Maximum leadtime to include. Default: 48.",
+    )
+
+    parser.add_argument(
+        "--seasonal",
+        action="store_true",
+        help="Run seasonal plots using seasonal MOS files.",
+    )
+
+    parser.add_argument(
+        "--non-seasonal",
+        action="store_true",
+        help="Run non-seasonal monthly plots.",
+    )
+
+    parser.add_argument(
+        "--month-start",
+        default="2024-09-01 00:00:00",
+        type=str,
+        help=(
+            "Start datetime for non-seasonal monthly plots. "
+            "Default: 2024-09-01 00:00:00."
+        ),
+    )
+
+    parser.add_argument(
+        "--month-end",
+        default="2025-08-31 12:00:00",
+        type=str,
+        help=(
+            "End datetime for non-seasonal monthly plots. "
+            "Default: 2025-08-31 12:00:00."
+        ),
+    )
+
+    parser.add_argument(
+        "--seasons",
+        nargs="+",
+        default=["autumn", "winter", "spring", "summer"],
+        help=(
+            "Seasons to process in seasonal mode. "
+            "Default: autumn winter spring summer."
+        ),
+    )
+
+    parser.add_argument(
+        "--stations-file",
+        default=None,
+        type=str,
+        help=(
+            "Optional text file containing station IDs to include, one per line. "
+            "If omitted, all stations in the data are used."
+        ),
+    )
+
+    parser.add_argument(
+        "--station-group-id",
+        default="All stations",
+        type=str,
+        help="Station/group ID used in output path and filenames. Default: All stations.",
+    )
+
+    parser.add_argument(
+        "--station-group-name",
+        default="All stations",
+        type=str,
+        help="Station/group name used in plot titles. Default: All stations.",
+    )
+
+    parser.add_argument(
+        "--show-plot",
+        action="store_true",
+        help="Show plots interactively.",
+    )
+
+    parser.add_argument(
+        "--no-save-plot",
+        action="store_true",
+        help="Do not save plots.",
+    )
+
+    parser.add_argument(
+        "--fig-dpi",
+        default=150,
+        type=int,
+        help="Figure DPI. Default: 150.",
+    )
+
+    return parser.parse_args()
+
+
+def load_station_subset(stations_file: str | None) -> list[str] | None:
+    """
+    Load optional station subset.
+
+    Returns:
+        None if no station file is given, meaning use all stations.
+        Otherwise returns a list of station IDs as strings.
+    """
+    if stations_file is None:
+        return None
+
+    path = Path(stations_file)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Stations file not found: {path}")
+
+    with open(path, "r") as f:
+        stations = [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    if not stations:
+        raise ValueError(f"No station IDs found in station file: {path}")
+
+    return stations
+
+
+def safe_name(text: str) -> str:
+    """Make a string safe for filenames and paths."""
+    return (
+        str(text)
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("≤", "le")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
+# =========================
 # Helpers
-#---------------
+# =========================
 
 def rmse(a, b):
-    """Calculate rmse between two sets of values"""
-    a = np.asarray(a, float); b = np.asarray(b, float)
+    """Calculate RMSE between two sets of values."""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+
     m = np.isfinite(a) & np.isfinite(b)
+
     if not m.any():
         return np.nan
-    return float(np.sqrt(np.mean((a[m]-b[m])**2)))
+
+    return float(np.sqrt(np.mean((a[m] - b[m]) ** 2)))
+
 
 def month_windows(start_str, end_str):
     """
-    Function to window data into montly windows
-    Yield (start_dt, end_dt_inclusive) for each month overlapping [start,end].
+    Yield monthly windows as (start_dt, end_dt_inclusive)
+    for each month overlapping [start, end].
     """
     start = pd.Timestamp(start_str).to_pydatetime()
-    end   = pd.Timestamp(end_str).to_pydatetime()
+    end = pd.Timestamp(end_str).to_pydatetime()
+
     y, m = start.year, start.month
     cur = datetime(y, m, 1)
+
     while cur <= end.replace(day=1):
         nd = calendar.monthrange(cur.year, cur.month)[1]
+
         m_start = max(cur, start)
-        m_end   = min(datetime(cur.year, cur.month, nd, 23, 59, 59), end)
+        m_end = min(datetime(cur.year, cur.month, nd, 23, 59, 59), end)
+
         yield m_start, m_end
-        # next month
-        ny, nm = (cur.year + (cur.month == 12), 1 if cur.month == 12 else cur.month + 1)
+
+        ny, nm = (
+            cur.year + (cur.month == 12),
+            1 if cur.month == 12 else cur.month + 1,
+        )
         cur = datetime(ny, nm, 1)
 
+
 def _pair_stats(y_true, y_pred):
-    """Calculates statistics for observations vs predictions
-        Params:
-            y_true = Observations
-            y_pred = Predictions
-        Returns: 
-            n = number of points
-            bias = Bias of the predictions (over/under estimation)
-            rmse = RMSE of the predictions
-            r2 = R squared value of the predictions
+    """
+    Calculate statistics for observations vs predictions.
+
+    Returns:
+        n, bias, RMSE, and R².
     """
     a = np.asarray(y_true, float)
     b = np.asarray(y_pred, float)
+
     m = np.isfinite(a) & np.isfinite(b)
-    a = a[m]; b = b[m]
+    a = a[m]
+    b = b[m]
+
     n = a.size
+
     if n == 0:
-        return {"n": 0, "bias": np.nan, "rmse": np.nan, "r2": np.nan}
+        return {
+            "n": 0,
+            "bias": np.nan,
+            "rmse": np.nan,
+            "r2": np.nan,
+        }
+
     bias = float(np.mean(b - a))
     rmse_v = float(np.sqrt(np.mean((b - a) ** 2)))
+
     if np.std(a) == 0 or np.std(b) == 0:
         r2 = np.nan
     else:
         r = float(np.corrcoef(a, b)[0, 1])
         r2 = r * r
-    return {"n": int(n), "bias": bias, "rmse": rmse_v, "r2": r2}
 
-def mos_coverage_window(mos_eval: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
-    return mos_eval[SPLIT].min(), mos_eval[SPLIT].max()
-#-----------------------------------------
-# Data loading and preparation functions
-#-----------------------------------------
+    return {
+        "n": int(n),
+        "bias": bias,
+        "rmse": rmse_v,
+        "r2": r2,
+    }
 
-def load_eval_rows_evaldir(eval_dir: Path, pattern: str, tag: str):
-    """Load the data
-        Params: 
-            eval_dir = Directory of the files
-            pattern = Filename pattern
-            tag = Name of the column/model data is loaded for
-        Return: Loaded data
+
+def mos_coverage_window(mos_eval: pl.DataFrame) -> tuple[datetime, datetime]:
+    usable = mos_eval.filter(
+        pl.col(MOS).is_not_null()
+        & pl.col(RAW).is_not_null()
+        & pl.col(OBS).is_not_null()
+        & pl.col(SPLIT).is_not_null()
+    )
+
+    if usable.height == 0:
+        raise ValueError("MOS eval rows have no usable values.")
+
+    return usable.select(
+        pl.col(SPLIT).min().alias("t0"),
+        pl.col(SPLIT).max().alias("t1"),
+    ).row(0)
+
+
+# =========================
+# Data loading and preparation
+# =========================
+
+def load_eval_rows_evaldir(
+    eval_dir: Path,
+    pattern: str,
+    tag: str,
+    ml_col: str,
+):
     """
-    # Gather the files
+    Load evaluation rows from parquet files.
+    """
     files = sorted(eval_dir.glob(pattern))
+
     if not files:
         raise FileNotFoundError(f"No files matched: {eval_dir}/{pattern}")
-  
-    # Loop through files and collect needed data
+
     dfs = []
+
     for f in files:
-        cols = KEYS + [RAW, OBS, MLCOL, MOS, "SID"]
-        # tolerate older files lacking RAW (we’ll drop if missing)
-        existing = [c for c in cols if c in pl.scan_parquet(str(f)).collect_schema().keys()]
-        df = pl.read_parquet(f, columns=existing).with_columns([
-            pl.col("SID").cast(pl.Utf8),
-            pl.col(SPLIT).cast(pl.Utf8),
-        ])
+        cols = KEYS + [RAW, OBS, ml_col, MOS, "SID"]
+
+        schema = pl.scan_parquet(str(f)).collect_schema().names()
+        existing = [c for c in cols if c in schema]
+
+        if not existing:
+            continue
+
+        df = pl.read_parquet(f, columns=existing)
+
+        exprs = []
+
+        if "SID" in df.columns:
+            exprs.append(pl.col("SID").cast(pl.Utf8))
+
+        if SPLIT in df.columns:
+            exprs.append(
+                pl.col(SPLIT)
+                .cast(pl.Utf8)
+                .str.to_datetime(strict=False)
+                .alias(SPLIT)
+            )
+
+        if "validtime" in df.columns:
+            exprs.append(
+                pl.col("validtime")
+                .cast(pl.Utf8)
+                .str.to_datetime(strict=False)
+                .alias("validtime")
+            )
+
+        if "leadtime" in df.columns:
+            exprs.append(pl.col("leadtime").cast(pl.Int64, strict=False))
+
+        if exprs:
+            df = df.with_columns(exprs)
+
         dfs.append(df)
 
-    # Concatenate the into one dataframe
+    if not dfs:
+        raise ValueError(f"No usable parquet data found in: {eval_dir}/{pattern}")
+
     out = pl.concat(dfs, how="vertical_relaxed")
 
     print(f"[INFO] {tag} rows loaded: {out.height:,}")
+
     return out
 
-def filter_for_station_init(df: pl.DataFrame, target_station: str, start_init: str, end_init:str, tag: str):
-    """Filter the dataframe to the wanted station and analysistime
-        Params: 
-            df = Dataframe
-            target_station = SID of the wanted target station
-            target_init = Date and time of the wanted analysistime
-            tag = Name of the column/model data is loaded for
-        Returns: Filtered dataframe"""
 
-    # Filter data to the target station and analysistime
-    plot_df = df.filter(
-        (pl.col("SID") == target_station) & (pl.col(SPLIT) >= start_init)
+def filter_for_station_init(
+    df: pl.DataFrame,
+    station_subset: list[str] | None,
+    start_init,
+    end_init,
+    tag: str,
+):
+    """
+    Filter dataframe to optional station subset and analysistime window.
+
+    If station_subset is None, all stations are used.
+    """
+    filter_expr = (
+        (pl.col(SPLIT) >= start_init)
         & (pl.col(SPLIT) <= end_init)
-    )   
+    )
+
+    if station_subset is not None:
+        filter_expr = filter_expr & pl.col("SID").is_in([str(s) for s in station_subset])
+
+    plot_df = df.filter(filter_expr)
 
     if plot_df.height == 0:
-        raise ValueError(f"No {tag} rows for SID={target_station}, init={start_init}_{end_init}")
-    
+        station_msg = (
+            "all stations"
+            if station_subset is None
+            else f"{len(station_subset)} selected stations"
+        )
+
+        raise ValueError(
+            f"No {tag} rows for {station_msg}, "
+            f"window={start_init} -> {end_init}"
+        )
+
     return plot_df
 
-def data_prep_for_plot(ml_plot, mos_plot, start_init, end_init):
-    """Function to join the prediction data and prepare the dataset for plotting
-        Params: 
-            ml_plot = Dataframe with ML model predictions (and observations)
-            mos_plot = Dataframe with MOS model predictions (and observations)
-            target_station = Unique station ID of the chosen station
-            start_init = Start date and time of the time window
-            end_init = End date and time of the time window
-        Returns: Joined and prepared dataframe
-    """
 
-    # If no ML predictions present use only MOS
+def data_prep_for_plot(ml_plot, mos_plot, start_init, end_init):
+    """
+    Join ML and MOS prediction data and prepare a pandas dataframe for plotting.
+    """
     if ml_plot.height == 0:
         print(f"[WARN] No ML rows for init={start_init}_{end_init}. Plotting without ML.")
-        # Use MOS-only
         joined = mos_plot
-    # If no MOS predictions present use only ML
+
     elif mos_plot.height == 0:
         print(f"[WARN] No MOS rows for init={start_init}_{end_init}. Plotting without MOS.")
-        # Use ML-only
         joined = ml_plot
-    # Otherwise use both
+
     else:
-        # Inner-join to align samples (same validtime/leadtime)
-        # Use ML (raw forecast) as the base
         joined = ml_plot.join(
             mos_plot.select(KEYS + [MOS]),
             on=KEYS,
             how="left",
-            suffix="_mos"
+            suffix="_mos",
         )
+
         for col in [RAW, OBS]:
             col_ml = f"{col}_ml"
+
             if col_ml in joined.columns and col in joined.columns:
                 joined = joined.drop(col_ml)
 
-    # Convert to pandas and prepare for plotting
     plot_pd = joined.to_pandas()
-    plot_pd["validtime"] = pd.to_datetime(plot_pd["validtime"])
-    plot_pd["analysistime"] = pd.to_datetime(plot_pd["analysistime"])
+
+    plot_pd["validtime"] = pd.to_datetime(plot_pd["validtime"], errors="coerce")
+    plot_pd["analysistime"] = pd.to_datetime(plot_pd["analysistime"], errors="coerce")
+
     plot_pd = plot_pd.sort_values(["analysistime", "validtime"])
 
     return plot_pd
 
 
-#------------------------------
+# =========================
 # Plot functions
-#------------------------------
+# =========================
 
 def scatter_density_one(
-    df: pd.DataFrame, obs_col: str, pred_col: str, station_id: str, station_name: str, start_init: str, end_init: str,
-    tag: str, cmap: str, gridsize: int = 60, mincnt: int = 1,
-    use_log_counts: bool = True,    # Enables log color + ticks
-    err_thresh: float | None = None,     # symmetric |pred-obs| <= T
-    err_thresh_pos: float | None = None, # asymmetric upper:  pred-obs >= +Tpos
-    err_thresh_neg: float | None = None, # asymmetric lower:  pred-obs <= -Tneg
-    shade_alpha: float = 0.12, band_alpha: float = 0.06, show_band: bool = False,
-    show_pct_outside: bool = True,  # Annotate percent outside the band
+    df: pd.DataFrame,
+    obs_col: str,
+    pred_col: str,
+    station_id: str,
+    station_name: str,
+    start_init,
+    end_init,
+    tag: str,
+    cmap: str,
+    out_dir: Path,
+    fig_dpi: int,
+    save_plot: bool,
+    show_plot: bool,
+    ml_name: str,
+    gridsize: int = 60,
+    mincnt: int = 1,
+    use_log_counts: bool = True,
+    err_thresh: float | None = None,
+    err_thresh_pos: float | None = None,
+    err_thresh_neg: float | None = None,
+    shade_alpha: float = 0.12,
+    band_alpha: float = 0.06,
+    show_band: bool = False,
+    show_pct_outside: bool = True,
     units: str = "K",
-    use_variable_threshold: bool = False,  # if True, overrides err_thresh/pos/neg
+    use_variable_threshold: bool = False,
     cold_cut: float = 258.15,
     cool_cut: float = 268.15,
-    cold_T: float = 5.0,    # K
-    cool_T: float = 3.5,    # K
-    warm_T: float = 2.5,    # K
-    season = None
+    cold_T: float = 5.0,
+    cool_T: float = 3.5,
+    warm_T: float = 2.5,
+    season=None,
 ):
-    
     """
-    Creates a scatter plot of the predictions vs observations colored by density.
-    Includes a band based on the hit rate and statistics to add more information. 
-    The scatter points are hexbins where the points are logarithmically binned
+    Create a scatter-density plot of predictions vs observations.
     """
-    # Extract finite pairs
     a = pd.to_numeric(df.get(obs_col, pd.Series(dtype=float)), errors="coerce")
     b = pd.to_numeric(df.get(pred_col, pd.Series(dtype=float)), errors="coerce")
+
     m = np.isfinite(a) & np.isfinite(b)
-    a = a[m].to_numpy(); b = b[m].to_numpy()
+
+    a = a[m].to_numpy()
+    b = b[m].to_numpy()
+
     if a.size == 0:
         print(f"[WARN] No finite {obs_col}/{pred_col} pairs for {station_id} ({tag})")
         return
 
-    # Get the statistics
     st = _pair_stats(a, b)
 
-
-    # Percentiles (0.5–99.5)
     x_lo, x_hi = np.nanpercentile(a, [0.5, 99.5])
     y_lo, y_hi = np.nanpercentile(b, [0.5, 99.5])
 
-    # Calculate span and center
     sx, sy = (x_hi - x_lo), (y_hi - y_lo)
-    if not np.isfinite(sx) or sx <= 0: sx = 1.0
-    if not np.isfinite(sy) or sy <= 0: sy = 1.0
 
-    # Extra padding (≈ 20% + one hex width)
+    if not np.isfinite(sx) or sx <= 0:
+        sx = 1.0
+
+    if not np.isfinite(sy) or sy <= 0:
+        sy = 1.0
+
     pad_x = 0.2 * sx + sx / gridsize
     pad_y = 0.2 * sy + sy / gridsize
 
-    # Keep equal axis ranges (square aspect)
     x_center = (x_hi + x_lo) / 2
     y_center = (y_hi + y_lo) / 2
+
     half_span = 0.5 * max(sx + 2 * pad_x, sy + 2 * pad_y)
 
     x0, x1 = x_center - half_span, x_center + half_span
     y0, y1 = y_center - half_span, y_center + half_span
 
-    # Add a bit of extra breathing room if needed
     margin = 0.01 * half_span
-    x0 -= margin; x1 += margin
-    y0 -= margin; y1 += margin
+    x0 -= margin
+    x1 += margin
+    y0 -= margin
+    y1 += margin
 
-    # Plot
     fig, ax = plt.subplots(figsize=(6.8, 6.2))
 
-    # Logarithmic counts to hexbins + plot the hexbins
     norm = LogNorm() if use_log_counts else None
+
     hb = ax.hexbin(
-        a, b,
+        a,
+        b,
         gridsize=gridsize,
         mincnt=mincnt,
         norm=norm,
         cmap=cmap,
-        extent=(x0, x1, y0, y1),  # lattice matches limits → no cropped hexes
+        extent=(x0, x1, y0, y1),
     )
 
-    # Colorbar configuration
     cb = fig.colorbar(hb, ax=ax, shrink=0.9)
     cb.set_label("Count per hexbin")
+
     if use_log_counts:
         cb.locator = LogLocator(base=10, subs="all")
         cb.update_ticks()
 
-    # Background shading for thresholds, if requested
-    want_fixed = (err_thresh is not None) or (err_thresh_pos is not None) or (err_thresh_neg is not None)
+    want_fixed = (
+        (err_thresh is not None)
+        or (err_thresh_pos is not None)
+        or (err_thresh_neg is not None)
+    )
 
     if use_variable_threshold or want_fixed:
         xs = np.linspace(x0, x1, 512)
 
-        # Piecewise thershold boundary by observation (x)
-        # Based on the hit rate boundaries 
-        # Cold <=258.15K
-        # 258.15K < Cool <= 268.15K
-        # Warm > 268.15K
         if use_variable_threshold:
-            Tx = np.where(xs <= cold_cut, cold_T,
-                 np.where(xs <= cool_cut, cool_T, warm_T))
-            y_plus  = xs + Tx
-            y_minus = xs - Tx
+            tx = np.where(
+                xs <= cold_cut,
+                cold_T,
+                np.where(xs <= cool_cut, cool_T, warm_T),
+            )
 
-            label_band_main = f"|pred−obs| ≤ T(obs);" 
+            y_plus = xs + tx
+            y_minus = xs - tx
+
+            label_band_main = "|pred−obs| ≤ T(obs)"
             upper_lbl = "pred−obs ≥ +T(obs)"
             lower_lbl = "pred−obs ≤ −T(obs)"
 
-        # Fixed thersholds
         else:
-            Tpos = err_thresh_pos if err_thresh_pos is not None else (err_thresh or 0.0)
-            Tneg = err_thresh_neg if err_thresh_neg is not None else (err_thresh or 0.0)
-            y_plus  = xs + Tpos
-            y_minus = xs - Tneg
+            t_pos = err_thresh_pos if err_thresh_pos is not None else (err_thresh or 0.0)
+            t_neg = err_thresh_neg if err_thresh_neg is not None else (err_thresh or 0.0)
 
-            label_band_main = f"|pred−obs| ≤ {max(Tpos, Tneg):g} {units}" if show_band else None
-            upper_lbl = f"pred−obs ≥ +{Tpos:g} {units}"
-            lower_lbl = f"pred−obs ≤ −{Tneg:g} {units}"
+            y_plus = xs + t_pos
+            y_minus = xs - t_neg
 
-        # Shade the out-of-band regions
-        ax.fill_between(xs, y_plus, y1, alpha=shade_alpha, label=upper_lbl, color= "#E64A19")
-        ax.fill_between(xs, y0, y_minus, alpha=shade_alpha, label=lower_lbl, color= "#004E9B")
+            label_band_main = f"|pred−obs| ≤ {max(t_pos, t_neg):g} {units}" if show_band else None
+            upper_lbl = f"pred−obs ≥ +{t_pos:g} {units}"
+            lower_lbl = f"pred−obs ≤ −{t_neg:g} {units}"
 
-        # Shade band interior
+        ax.fill_between(xs, y_plus, y1, alpha=shade_alpha, label=upper_lbl, color="#E64A19")
+        ax.fill_between(xs, y0, y_minus, alpha=shade_alpha, label=lower_lbl, color="#004E9B")
+
         if show_band:
-            ax.fill_between(xs, y_minus, y_plus, alpha=band_alpha, color = "#66E247",
-                            label=label_band_main if label_band_main else None)
-
-        # Boundary lines
-        ax.plot(xs, y_plus,  linestyle="-", linewidth=1.0, color= "#E64A19")
-        ax.plot(xs, y_minus, linestyle="-", linewidth=1.0, color= "#004E9B")
-
-        # % outside text and calculation
-        if show_pct_outside:
-            err = b - a
-            if use_variable_threshold:
-                # per-sample T depends on obs 'a'
-                Ta = np.where(a <= cold_cut, cold_T,
-                     np.where(a <= cool_cut, cool_T, warm_T))
-                out_frac = np.mean(np.abs(err) >= Ta) * 100.0
-            else:
-                Tpos = err_thresh_pos if err_thresh_pos is not None else (err_thresh or 0.0)
-                Tneg = err_thresh_neg if err_thresh_neg is not None else (err_thresh or 0.0)
-                out_frac = np.mean((err >= Tpos) | (err <= -Tneg)) * 100.0
-
-            # % outside text box configuration
-            ax.text(
-                0.02, 0.8,
-                f"{out_frac:.1f}% outside band",
-                transform=ax.transAxes,
-                ha="left", va="bottom",
-                bbox=dict(boxstyle="round", alpha=0.20)
+            ax.fill_between(
+                xs,
+                y_minus,
+                y_plus,
+                alpha=band_alpha,
+                color="#66E247",
+                label=label_band_main if label_band_main else None,
             )
 
-    # Plot parameters
-    ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
-    ax.plot([x0, x1], [x0, x1], linewidth=1.2, color = "#444444")
+        ax.plot(xs, y_plus, linestyle="-", linewidth=1.0, color="#E64A19")
+        ax.plot(xs, y_minus, linestyle="-", linewidth=1.0, color="#004E9B")
+
+        if show_pct_outside:
+            err = b - a
+
+            if use_variable_threshold:
+                ta = np.where(
+                    a <= cold_cut,
+                    cold_T,
+                    np.where(a <= cool_cut, cool_T, warm_T),
+                )
+                out_frac = np.mean(np.abs(err) >= ta) * 100.0
+
+            else:
+                t_pos = err_thresh_pos if err_thresh_pos is not None else (err_thresh or 0.0)
+                t_neg = err_thresh_neg if err_thresh_neg is not None else (err_thresh or 0.0)
+                out_frac = np.mean((err >= t_pos) | (err <= -t_neg)) * 100.0
+
+            ax.text(
+                0.02,
+                0.8,
+                f"{out_frac:.1f}% outside band",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                bbox=dict(boxstyle="round", alpha=0.20),
+            )
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+
+    ax.plot([x0, x1], [x0, x1], linewidth=1.2, color="#444444")
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(f"Observation [{units}]", fontsize = 12)
-    ax.set_ylabel(f"{tag} corrected prediction [{units}]" if tag in ("MOS",ML_NAME) else f"Prediction [{units}]", fontsize = 12)
+
+    ax.set_xlabel(f"Observation [{units}]", fontsize=12)
+
+    if tag in ("MOS", ml_name):
+        ylabel = f"{tag} corrected prediction [{units}]"
+    else:
+        ylabel = f"Prediction [{units}]"
+
+    ax.set_ylabel(ylabel, fontsize=12)
+
     title_range = f"{pd.to_datetime(start_init):%Y-%m-%d} .. {pd.to_datetime(end_init):%Y-%m-%d}"
-    ax.set_title(f"{station_name} {station_id} \n Inits {title_range}\nObs vs {tag} (density)", fontsize = 20)
+
+    ax.set_title(
+        f"{station_name} {station_id}\n"
+        f"Inits {title_range}\n"
+        f"Obs vs {tag} (density)",
+        fontsize=20,
+    )
+
     ax.grid(True, which="both", linestyle="--", linewidth=0.7, alpha=0.7)
     ax.legend(loc="lower right", framealpha=0.85)
-    fig.tight_layout()
 
-    # Statistics text box text
     s_txt = (
         f"N = {st['n']}\n"
         f"Bias = {st['bias']:.3g}\n"
         f"RMSE = {st['rmse']:.3g}\n"
-        f"R\u00b2 = {st['r2']:.3g}" if np.isfinite(st["r2"]) else
-        f"N = {st['n']}\nBias = {st['bias']:.3g}\nRMSE = {st['rmse']:.3g}\nR\u00b2 = NA"
+        f"R² = {st['r2']:.3g}"
+        if np.isfinite(st["r2"])
+        else
+        f"N = {st['n']}\n"
+        f"Bias = {st['bias']:.3g}\n"
+        f"RMSE = {st['rmse']:.3g}\n"
+        f"R² = NA"
     )
 
-    # Statistics text box configuration
     ax.text(
-        0.02, 0.98, s_txt,
+        0.02,
+        0.98,
+        s_txt,
         transform=ax.transAxes,
-        ha="left", va="top",
-        bbox=dict(boxstyle="round", alpha=0.2)
+        ha="left",
+        va="top",
+        bbox=dict(boxstyle="round", alpha=0.2),
     )
 
-    # Save/show plot
+    fig.tight_layout()
+
     month_tag = f"{pd.to_datetime(start_init):%Y%m}"
-    out_path = OUT_DIR / f"{station_id}" / month_tag
+    season_tag = safe_name(season if season is not None else "full")
+    station_tag = safe_name(station_id)
+    model_tag = safe_name(tag)
+
+    out_path = out_dir / station_tag / month_tag
     out_path.mkdir(parents=True, exist_ok=True)
-    out_svg = out_path / f"scatter_density_{tag}_{station_id}_{month_tag}_{season}.svg"
-    if SAVE_PLOT:
-        fig.savefig(out_svg, dpi=FIG_DPI, bbox_inches="tight")
+
+    out_svg = out_path / f"scatter_density_{model_tag}_{station_tag}_{month_tag}_{season_tag}.svg"
+
+    if save_plot:
+        fig.savefig(out_svg, dpi=fig_dpi, bbox_inches="tight")
         print(f"[OK] Saved {out_svg}")
-        plt.close(fig)
-    if SHOW_PLOT: plt.show()
-    else: plt.close(fig)
+
+    if show_plot:
+        plt.show()
+
+    plt.close(fig)
 
 
+def plot_three_models(
+    plot_pd: pd.DataFrame,
+    station_id: str,
+    station_name: str,
+    start_init,
+    end_init,
+    leadtime: int,
+    ml_col: str,
+    ml_name: str,
+    out_dir: Path,
+    fig_dpi: int,
+    save_plot: bool,
+    show_plot: bool,
+    season=None,
+):
+    """Create MOS, ML, and ECMWF plots when the needed columns exist."""
+    common_kwargs = dict(
+        df=plot_pd,
+        station_id=station_id,
+        station_name=station_name,
+        start_init=start_init,
+        end_init=end_init,
+        use_log_counts=True,
+        cmap="turbo",
+        use_variable_threshold=True,
+        cold_cut=258.15,
+        cold_T=5.0,
+        cool_cut=268.15,
+        cool_T=3.5,
+        warm_T=2.5,
+        show_band=True,
+        units="K",
+        out_dir=out_dir,
+        fig_dpi=fig_dpi,
+        save_plot=save_plot,
+        show_plot=show_plot,
+        ml_name=ml_name,
+        season=season,
+    )
+
+    if MOS in plot_pd.columns:
+        scatter_density_one(
+            obs_col=OBS,
+            pred_col=MOS,
+            tag=f"MOS_le{leadtime}h",
+            **common_kwargs,
+        )
+
+    if ml_col in plot_pd.columns:
+        scatter_density_one(
+            obs_col=OBS,
+            pred_col=ml_col,
+            tag=f"{ml_name}_le{leadtime}h",
+            **common_kwargs,
+        )
+
+    if RAW in plot_pd.columns:
+        scatter_density_one(
+            obs_col=OBS,
+            pred_col=RAW,
+            tag=f"ECMWF_le{leadtime}h",
+            **common_kwargs,
+        )
+
+
+# =========================
+# Main
+# =========================
 
 def main():
-    # Set wanted stations 
-    stations = ["101886", "101928", "101932", "102016", "102033", "102035"]
+    args = parse_args()
 
-    # Set wanted start and end dates (now the whole test period)
-    month_start = "2024-09-01 00:00:00"
-    month_end   = "2025-08-31 12:00:00"  # inclusive end of the whole loop range
+    if args.seasonal and args.non_seasonal:
+        raise ValueError("Use either --seasonal or --non-seasonal, not both.")
 
-    if SEASONAL:
-        seasons = ["autumn", "winter", "spring", "summer"]
+    seasonal = True if args.seasonal else False
 
-        # Load ML predictions once (covers all seasons if your files do)
-        ml_data_full = load_eval_rows_evaldir(ML_DIR, f"eval_rows_{SPLIT}_{ML_TAG}_*.parquet", MLCOL)
+    mos_dir = Path(args.mos_dir)
+    ml_dir = Path(args.ml_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        for season in seasons:
-            # Load MOS once per season
-            mos_data_season = load_eval_rows_evaldir(MOS_DIR, f"eval_rows_{SPLIT}_MOS_*_{season}.parquet", MOS)
+    ml_tag = args.ml_tag
+    ml_name = args.ml_name
+    ml_col = f"corrected_{ml_tag}"
 
-            # Determine coverage window for the season (shared across stations)
+    leadtime = args.leadtime
+    save_plot = not args.no_save_plot
+    show_plot = args.show_plot
+    fig_dpi = args.fig_dpi
+
+    station_subset = load_station_subset(args.stations_file)
+
+    if station_subset is None:
+        print("[INFO] Using all stations in the data.")
+    else:
+        print(f"[INFO] Using station subset from {args.stations_file}: {len(station_subset)} stations")
+
+    print(f"[INFO] MOS directory: {mos_dir}")
+    print(f"[INFO] ML directory: {ml_dir}")
+    print(f"[INFO] Output directory: {out_dir}")
+    print(f"[INFO] ML tag: {ml_tag}")
+    print(f"[INFO] ML column: {ml_col}")
+    print(f"[INFO] ML name: {ml_name}")
+    print(f"[INFO] Leadtime <= {leadtime}")
+    print(f"[INFO] Seasonal mode: {seasonal}")
+
+    station_id = args.station_group_id
+    station_name = args.station_group_name
+
+    if seasonal:
+        ml_data_full = load_eval_rows_evaldir(
+            ml_dir,
+            f"eval_rows_{SPLIT}_{ml_tag}_*.parquet",
+            ml_col,
+            ml_col=ml_col,
+        )
+
+        for season in args.seasons:
+            print(f"\n[INFO] Processing season: {season}")
+
+            mos_data_season = load_eval_rows_evaldir(
+                mos_dir,
+                f"eval_rows_{SPLIT}_MOS_*_{season}.parquet",
+                MOS,
+                ml_col=ml_col,
+            )
+
             start_init, end_init = mos_coverage_window(mos_data_season)
 
-            leadtime = LEADTIME
             mos_ltd = mos_data_season.filter(pl.col("leadtime") <= leadtime)
-            ml_ltd  = ml_data_full.filter(pl.col("leadtime") <= leadtime)
+            ml_ltd = ml_data_full.filter(pl.col("leadtime") <= leadtime)
 
-            all_stations_mos_ltd = []
-            all_stations_ml_ltd  = []
-            for sid in stations:
-                station_id = str(sid)
-                mos_filter = filter_for_station_init(mos_ltd, station_id, start_init, end_init, MOS)
-                ml_filter  = filter_for_station_init(ml_ltd,  station_id, start_init, end_init, ML_TAG)
-                if mos_filter is not None and len(mos_filter) > 0:
-                    all_stations_mos_ltd.append(mos_filter)
-                if ml_filter is not None and len(ml_filter) > 0:
-                    all_stations_ml_ltd.append(ml_filter)
+            try:
+                all_mos_ltd = filter_for_station_init(
+                    mos_ltd,
+                    station_subset,
+                    start_init,
+                    end_init,
+                    MOS,
+                )
+            except ValueError as e:
+                print(f"[WARN] {e}")
+                all_mos_ltd = pl.DataFrame()
 
-            all_mos_ldt = pl.concat(all_stations_mos_ltd)
-            all_ml_ldt  = pl.concat(all_stations_ml_ltd)
+            try:
+                all_ml_ltd = filter_for_station_init(
+                    ml_ltd,
+                    station_subset,
+                    start_init,
+                    end_init,
+                    ml_tag,
+                )
+            except ValueError as e:
+                print(f"[WARN] {e}")
+                all_ml_ltd = pl.DataFrame()
 
-            if all_mos_ldt.height == 0 and all_ml_ldt.height == 0:
-                print(f"[{season} leadtime≤{leadtime}] No data after station filtering — skipping.")
-            else:
-                plot_pd = data_prep_for_plot(all_ml_ldt, all_mos_ldt, start_init=start_init, end_init=end_init)
-                station_id   = "North Finland"
-                station_name = "All stations"
+            if all_mos_ltd.height == 0 and all_ml_ltd.height == 0:
+                print(f"[{season} leadtime <= {leadtime}] No data after filtering; skipping.")
+                continue
 
-                if MOS in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=MOS,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"MOS (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K", season=season
-                    )
-                if MLCOL in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=MLCOL,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"{ML_NAME} (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K", season=season
-                    )
-                if RAW in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=RAW,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"ECMWF (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K", season=season
-                    )
+            plot_pd = data_prep_for_plot(
+                all_ml_ltd,
+                all_mos_ltd,
+                start_init=start_init,
+                end_init=end_init,
+            )
+
+            plot_three_models(
+                plot_pd=plot_pd,
+                station_id=station_id,
+                station_name=station_name,
+                start_init=start_init,
+                end_init=end_init,
+                leadtime=leadtime,
+                ml_col=ml_col,
+                ml_name=ml_name,
+                out_dir=out_dir,
+                fig_dpi=fig_dpi,
+                save_plot=save_plot,
+                show_plot=show_plot,
+                season=season,
+            )
 
     else:
-        # Non-seasonal: plot per month window, concatenated across all stations
-        mos_data_full = load_eval_rows_evaldir(MOS_DIR, f"eval_rows_{SPLIT}_MOS_*.parquet", MOS)
-        ml_data_full  = load_eval_rows_evaldir(ML_DIR,  f"eval_rows_{SPLIT}_{ML_TAG}_*.parquet", MLCOL)
+        print("\n[INFO] Processing non-seasonal monthly plots")
 
-        for m_start, m_end in month_windows(month_start, month_end):
-            start_init = m_start.strftime("%Y-%m-%d %H:%M:%S")
-            end_init   = m_end.strftime("%Y-%m-%d %H:%M:%S")
+        mos_data_full = load_eval_rows_evaldir(
+            mos_dir,
+            f"eval_rows_{SPLIT}_MOS_*.parquet",
+            MOS,
+            ml_col=ml_col,
+        )
 
-            leadtime = LEADTIME
+        ml_data_full = load_eval_rows_evaldir(
+            ml_dir,
+            f"eval_rows_{SPLIT}_{ml_tag}_*.parquet",
+            ml_col,
+            ml_col=ml_col,
+        )
+
+        for m_start, m_end in month_windows(args.month_start, args.month_end):
+            start_init = m_start
+            end_init = m_end
+
+            print(f"\n[INFO] Processing month window: {start_init} -> {end_init}")
+
             mos_ltd = mos_data_full.filter(pl.col("leadtime") <= leadtime)
-            ml_ltd  = ml_data_full.filter(pl.col("leadtime") <= leadtime)
+            ml_ltd = ml_data_full.filter(pl.col("leadtime") <= leadtime)
 
-            all_stations_mos_ltd = []
-            all_stations_ml_ltd  = []
-            for sid in stations:
-                station_id = str(sid)
-                mos_filter = filter_for_station_init(mos_ltd, station_id, start_init, end_init, MOS)
-                ml_filter  = filter_for_station_init(ml_ltd,  station_id, start_init, end_init, ML_TAG)
-                if mos_filter is not None and len(mos_filter) > 0:
-                    all_stations_mos_ltd.append(mos_filter)
-                if ml_filter is not None and len(ml_filter) > 0:
-                    all_stations_ml_ltd.append(ml_filter)
+            try:
+                all_mos_ltd = filter_for_station_init(
+                    mos_ltd,
+                    station_subset,
+                    start_init,
+                    end_init,
+                    MOS,
+                )
+            except ValueError as e:
+                print(f"[WARN] {e}")
+                all_mos_ltd = pl.DataFrame()
 
-            all_mos_ltd = pl.concat(all_stations_mos_ltd)
-            all_ml_ltd  = pl.concat(all_stations_ml_ltd)
+            try:
+                all_ml_ltd = filter_for_station_init(
+                    ml_ltd,
+                    station_subset,
+                    start_init,
+                    end_init,
+                    ml_tag,
+                )
+            except ValueError as e:
+                print(f"[WARN] {e}")
+                all_ml_ltd = pl.DataFrame()
 
-            if all_mos_ltd.height == 0 and all_ml_ldt.height == 0:
-                print(f"[{start_init} – {end_init}, leadtime≤{leadtime}] No data after station filtering — skipping.")
-            else:
-                plot_pd = data_prep_for_plot(all_ml_ltd, all_mos_ltd, start_init=start_init, end_init=end_init)
-                station_id   = "North Finland"
-                station_name = "All stations"
+            if all_mos_ltd.height == 0 and all_ml_ltd.height == 0:
+                print(
+                    f"[{start_init} -> {end_init}, leadtime <= {leadtime}] "
+                    f"No data after filtering; skipping."
+                )
+                continue
 
-                if MOS in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=MOS,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"MOS (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K",
-                    )
-                if MLCOL in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=MLCOL,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"{ML_NAME} (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K",
-                    )
-                if RAW in plot_pd.columns:
-                    scatter_density_one(
-                        df=plot_pd, obs_col=OBS, pred_col=RAW,
-                        station_id=station_id, station_name=station_name,
-                        start_init=start_init, end_init=end_init,
-                        tag=f"ECMWF (≤{leadtime}h)", use_log_counts=True, cmap="turbo",
-                        use_variable_threshold=True, cold_cut=258.15, cold_T=5.0,
-                        cool_cut=268.15,  cool_T=3.5, warm_T=2.5,
-                        show_band=True, units="K",
-                    )
+            plot_pd = data_prep_for_plot(
+                all_ml_ltd,
+                all_mos_ltd,
+                start_init=start_init,
+                end_init=end_init,
+            )
 
-
+            plot_three_models(
+                plot_pd=plot_pd,
+                station_id=station_id,
+                station_name=station_name,
+                start_init=start_init,
+                end_init=end_init,
+                leadtime=leadtime,
+                ml_col=ml_col,
+                ml_name=ml_name,
+                out_dir=out_dir,
+                fig_dpi=fig_dpi,
+                save_plot=save_plot,
+                show_plot=show_plot,
+                season="full",
+            )
 
 
 if __name__ == "__main__":

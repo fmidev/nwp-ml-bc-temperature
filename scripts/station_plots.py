@@ -1,76 +1,174 @@
+import argparse
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Paths
-MY_DATA_DIR = Path.home() / "thesis_project" / "data"
-OUT_DIR = Path.home() / "thesis_project" / "figures" / "station_plots"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MAPS_DIR = Path.home() / "thesis_project" / "data" / "maps"
-world = gpd.read_file(MAPS_DIR / "ne_110m_admin_0_countries.shp")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot station locations on a map and station elevation histogram."
+    )
 
-# Load the data
-csv_file = MY_DATA_DIR / "stations.csv"
+    parser.add_argument(
+        "--stations-csv",
+        required=True,
+        type=str,
+        help="Path to stations.csv. Must contain at least lon and lat columns.",
+    )
+
+    parser.add_argument(
+        "--maps-dir",
+        required=True,
+        type=str,
+        help=(
+            "Directory containing the Natural Earth shapefile. "
+            "Expected file: ne_110m_admin_0_countries.shp"
+        ),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=str,
+        help="Directory where station_map.png and elevation_hist.png will be saved.",
+    )
+
+    parser.add_argument(
+        "--lon-min",
+        default=-25.0,
+        type=float,
+        help="Minimum longitude for map extent.",
+    )
+
+    parser.add_argument(
+        "--lon-max",
+        default=42.0,
+        type=float,
+        help="Maximum longitude for map extent.",
+    )
+
+    parser.add_argument(
+        "--lat-min",
+        default=25.5,
+        type=float,
+        help="Minimum latitude for map extent.",
+    )
+
+    parser.add_argument(
+        "--lat-max",
+        default=72.0,
+        type=float,
+        help="Maximum latitude for map extent.",
+    )
+
+    return parser.parse_args()
 
 
-# From MOS wiki the approximate area of the stations 
-LON_MIN, LAT_MIN = -25.0, 25.5   
-LON_MAX, LAT_MAX =  42.0, 72.0 
+def main():
+    args = parse_args()
 
-df = pd.read_csv(csv_file)
+    stations_csv = Path(args.stations_csv)
+    maps_dir = Path(args.maps_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# Make geodataframe 
-gdf = gpd.GeoDataFrame(df,
-                       geometry = gpd.points_from_xy(df["lon"], df["lat"]),
-                       crs = "EPSG:4326")
+    world_path = maps_dir / "ne_110m_admin_0_countries.shp"
 
+    if not stations_csv.exists():
+        raise FileNotFoundError(f"Stations CSV not found: {stations_csv}")
 
-fig, ax = plt.subplots(figsize = (8,10), dpi = 150)
+    if not world_path.exists():
+        raise FileNotFoundError(f"Map shapefile not found: {world_path}")
 
-# Plot the base map 
-world.plot(ax = ax, color ="#f2f2f2", edgecolor="#999999", linewidth=0.5)
+    df = pd.read_csv(stations_csv)
 
-# Plot the station points with color based on elevation
-gdf.plot(ax=ax,
-         column="elev" if "elev" in gdf.columns else None,
-         cmap="viridis_r",
-         markersize=18,
-         edgecolor="black",
-         linewidth=0.3,
-         alpha=0.9,
-         legend=True,
-         legend_kwds={"label": "Elevation (m)",
-            "orientation": "horizontal",
-            "shrink": 0.6})
+    required_cols = {"lon", "lat"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Stations CSV is missing required columns: {sorted(missing)}")
 
-ax.set_xlim(LON_MIN, LON_MAX)
-ax.set_ylim(LAT_MIN, LAT_MAX)
+    world = gpd.read_file(world_path)
 
-ax.set_title("Map of the stations")
-ax.set_xlabel("Longitude")
-ax.set_ylabel("Latitude")
-ax.grid(True, linestyle="--", alpha=0.3)
+    gdf = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df["lon"], df["lat"]),
+        crs="EPSG:4326",
+    )
 
-# Save figure
-plt.tight_layout()
-plt.savefig(OUT_DIR / "station_map.png", bbox_inches="tight")
-plt.close()
+    fig, ax = plt.subplots(figsize=(8, 10), dpi=150)
 
-elev = df["elev"]
+    world.plot(
+        ax=ax,
+        color="#f2f2f2",
+        edgecolor="#999999",
+        linewidth=0.5,
+    )
 
+    plot_kwargs = {
+        "ax": ax,
+        "markersize": 18,
+        "edgecolor": "black",
+        "linewidth": 0.3,
+        "alpha": 0.9,
+    }
 
-# Plot histogram
-plt.figure(figsize=(8, 6), dpi=120)
-plt.hist(elev, bins=30, color="lightblue", edgecolor="black", alpha=0.8)
+    if "elev" in gdf.columns:
+        plot_kwargs.update(
+            {
+                "column": "elev",
+                "cmap": "viridis_r",
+                "legend": True,
+                "legend_kwds": {
+                    "label": "Elevation (m)",
+                    "orientation": "horizontal",
+                    "shrink": 0.6,
+                },
+            }
+        )
 
-plt.title("Distribution of Station Elevations")
-plt.xlabel("Elevation (m)")
-plt.ylabel("Number of Stations")
-plt.grid(axis="y", linestyle="--", alpha=0.7)
+    gdf.plot(**plot_kwargs)
 
-# Save the figure
-plt.tight_layout()
-plt.savefig(OUT_DIR / "elevation_hist.png")
-plt.close()
+    ax.set_xlim(args.lon_min, args.lon_max)
+    ax.set_ylim(args.lat_min, args.lat_max)
+
+    ax.set_title("Map of the stations")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    station_map_path = out_dir / "station_map.png"
+    plt.tight_layout()
+    plt.savefig(station_map_path, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved station map to: {station_map_path}")
+
+    if "elev" in df.columns:
+        elev = pd.to_numeric(df["elev"], errors="coerce").dropna()
+
+        plt.figure(figsize=(8, 6), dpi=120)
+        plt.hist(
+            elev,
+            bins=30,
+            color="lightblue",
+            edgecolor="black",
+            alpha=0.8,
+        )
+
+        plt.title("Distribution of Station Elevations")
+        plt.xlabel("Elevation (m)")
+        plt.ylabel("Number of Stations")
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+
+        elevation_hist_path = out_dir / "elevation_hist.png"
+        plt.tight_layout()
+        plt.savefig(elevation_hist_path)
+        plt.close()
+
+        print(f"Saved elevation histogram to: {elevation_hist_path}")
+    else:
+        print("No 'elev' column found; skipped elevation histogram.")
+
+if __name__ == "__main__":
+    main()

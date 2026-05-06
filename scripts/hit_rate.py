@@ -2,16 +2,9 @@ import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import argparse
 
-# Paths
-HOME = Path.home()
-DATA_DIR = HOME / "thesis_project" / "data"
-METRICS_DIR = HOME / "thesis_project" / "metrics"
-MOS_DIR = METRICS_DIR / "mos"
-ML1_DIR = METRICS_DIR / "tuned_full_new"
 
-OUT_DIR = METRICS_DIR / "hitrate" / "LSTM"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Columns
 SPLIT = "validtime"
@@ -19,9 +12,9 @@ OBS   = "obs_TA"
 RAW   = "raw_fc"
 MOS_CORR = "corrected_mos"
 
-ML1_TAG = "tuned_full"
-ML1_CORR = f"corrected_{ML1_TAG}"
-MLNAME = "XGBoost"
+ML1_TAG = None
+ML1_CORR = None
+MLNAME = None
 
 SEASONAL = True
 
@@ -29,6 +22,97 @@ SEASONAL = True
 # ------------------------------------------------
 # Data loading and preparation functions
 # ------------------------------------------------
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute hit rates by aligning MOS and ML evaluation rows."
+    )
+
+    parser.add_argument(
+        "--mos-dir",
+        required=True,
+        type=str,
+        help="Directory containing MOS evaluation parquet files.",
+    )
+
+    parser.add_argument(
+        "--ml-dir",
+        required=True,
+        type=str,
+        help="Directory containing ML evaluation parquet files.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=str,
+        help="Directory where hit-rate CSV files will be saved.",
+    )
+
+    parser.add_argument(
+        "--ml-tag",
+        default="tuned_full",
+        type=str,
+        help="ML model tag used in corrected_<tag> column and input filenames.",
+    )
+
+    parser.add_argument(
+        "--ml-name",
+        default="XGBoost",
+        type=str,
+        help="Readable model name used in output filenames and labels.",
+    )
+
+    parser.add_argument(
+        "--seasonal",
+        action="store_true",
+        help="Compute separate seasonal hit-rate files.",
+    )
+
+    parser.add_argument(
+        "--non-seasonal",
+        action="store_true",
+        help="Compute one combined hit-rate file instead of seasonal files.",
+    )
+
+    parser.add_argument(
+        "--stations-file",
+        default=None,
+        type=str,
+        help=(
+            "Optional text file containing station IDs to include, one per line. "
+            "If omitted, all stations in the aligned data are used."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def load_station_subset(stations_file: str | None) -> list[str] | None:
+    """
+    Load optional station subset.
+
+    Returns:
+        None if no station file is given, meaning use all stations.
+        Otherwise returns a list of station IDs as strings.
+    """
+    if stations_file is None:
+        return None
+
+    path = Path(stations_file)
+
+    with open(path, "r") as f:
+        stations = [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    if not stations:
+        raise ValueError(f"No station IDs found in station file: {path}")
+
+    return stations
 
 def _read_parquet_subset(file_path: Path, cols: list[str]) -> pd.DataFrame:
     """Read only columns that exist in the parquet file."""
@@ -236,13 +320,40 @@ def hit_rate(
 
 
 def main():
-    stations = ["100917", "100932", "100896", "101044", "101065", "101118", "101237", "101268", "101339",
-                "101398", "101430", "101537", "101570", "101608", "101725", "101794", "101886", "101928",
-                "101932", "10201", "102033", "102035"]
+    global ML1_TAG, ML1_CORR, MLNAME
 
-    ml1_eval = load_model_eval_rows(ML1_DIR, ML1_TAG)
+    args = parse_args()
 
-    if SEASONAL:
+    mos_dir = Path(args.mos_dir)
+    ml1_dir = Path(args.ml_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ML1_TAG = args.ml_tag
+    ML1_CORR = f"corrected_{ML1_TAG}"
+    MLNAME = args.ml_name
+
+    if args.seasonal and args.non_seasonal:
+        raise ValueError("Use either --seasonal or --non-seasonal, not both.")
+
+    if args.non_seasonal:
+        seasonal = False
+    else:
+        # Default to seasonal if neither option is given,
+        # matching your original SEASONAL = True behavior.
+        seasonal = True
+
+    station_subset = load_station_subset(args.stations_file)
+
+    ml1_eval = load_model_eval_rows(ml1_dir, ML1_TAG)
+
+    rename_map = {
+        RAW: "Raw forecast",
+        MOS_CORR: "MOS",
+        ML1_CORR: f"EC_ML_{MLNAME}",
+    }
+
+    if seasonal:
         AVAILABLE = {
             "2024": ["autumn"],
             "2025": ["winter", "spring", "summer"],
@@ -251,36 +362,46 @@ def main():
         for year, seasons in AVAILABLE.items():
             for season in seasons:
                 mos_eval = load_eval_rows_evaldir(
-                    MOS_DIR,
+                    mos_dir,
                     pattern=f"eval_rows_{SPLIT}_MOS_{year}_{season}.parquet",
-                    cols=["SID", SPLIT, "analysistime", "leadtime", RAW, OBS, MOS_CORR],
+                    cols=[
+                        "SID",
+                        SPLIT,
+                        "analysistime",
+                        "leadtime",
+                        RAW,
+                        OBS,
+                        MOS_CORR,
+                    ],
                 )
 
                 t0, t1 = mos_coverage_window(mos_eval)
                 print(f"MOS coverage window: {t0} → {t1}")
 
                 joined = align_mos_window(mos_eval, ml1_eval, t0, t1)
-                joined = joined[joined["SID"].isin(stations)]
-                print("Rows after alignment (single):", len(joined))
-                print("Stations after alignment (single):", joined["SID"].nunique())
 
-                results = hit_rate(joined, pred_cols=[RAW, MOS_CORR, ML1_CORR], by="leadtime")
+                if station_subset is not None:
+                    joined = joined[joined["SID"].isin(station_subset)].copy()
+                    print(f"Applied station subset from: {args.stations_file}")
+                else:
+                    print("Using all stations in aligned data.")
 
-                rename_map = {
-                    RAW: "Raw forecast",
-                    MOS_CORR: "MOS",
-                    ML1_CORR: f"EC_ML_{MLNAME}",
-                }
+                print("Rows after alignment:", len(joined))
+                print("Stations after alignment:", joined["SID"].nunique())
+
+                results = hit_rate(
+                    joined,
+                    pred_cols=[RAW, MOS_CORR, ML1_CORR],
+                    by="leadtime",
+                )
 
                 results["overall"]["model"] = results["overall"]["model"].replace(rename_map)
+
                 if "by" in results:
                     results["by"]["model"] = results["by"]["model"].replace(rename_map)
 
                 print("Overall hit rates:")
                 print(results["overall"].to_string(index=False))
-
-                if "by" in results:
-                    print("\nHit rate by leadtime:")
 
                 overall = results["overall"].copy()
                 overall["level"] = "overall"
@@ -288,46 +409,60 @@ def main():
                 if "by" in results:
                     by_df = results["by"].copy()
                     by_df["level"] = "by_leadtime"
-                    combined = pd.concat([overall, by_df], ignore_index=True, sort=False)
+                    combined = pd.concat(
+                        [overall, by_df],
+                        ignore_index=True,
+                        sort=False,
+                    )
                 else:
                     combined = overall
 
-                out_path = OUT_DIR / f"hit_rate_{MLNAME}_{season}.csv"
+                out_path = out_dir / f"hit_rate_{MLNAME}_{season}.csv"
                 combined.to_csv(out_path, index=False)
                 print(f"\nCombined results saved to: {out_path}")
 
     else:
         mos_eval = load_eval_rows_evaldir(
-            MOS_DIR,
+            mos_dir,
             pattern=f"eval_rows_{SPLIT}_MOS_202*.parquet",
-            cols=["SID", SPLIT, "analysistime", "leadtime", RAW, OBS, MOS_CORR],
+            cols=[
+                "SID",
+                SPLIT,
+                "analysistime",
+                "leadtime",
+                RAW,
+                OBS,
+                MOS_CORR,
+            ],
         )
 
         t0, t1 = mos_coverage_window(mos_eval)
         print(f"MOS coverage window: {t0} → {t1}")
 
         joined = align_mos_window(mos_eval, ml1_eval, t0, t1)
-        joined = joined[joined["SID"].isin(stations)]
-        print("Rows after alignment (single):", len(joined))
-        print("Stations after alignment (single):", joined["SID"].nunique())
 
-        results = hit_rate(joined, pred_cols=[RAW, MOS_CORR, ML1_CORR], by="leadtime")
+        if station_subset is not None:
+            joined = joined[joined["SID"].isin(station_subset)].copy()
+            print(f"Applied station subset from: {args.stations_file}")
+        else:
+            print("Using all stations in aligned data.")
 
-        rename_map = {
-            RAW: "Raw forecast",
-            MOS_CORR: "MOS",
-            ML1_CORR: f"EC_ML_{MLNAME}",
-        }
+        print("Rows after alignment:", len(joined))
+        print("Stations after alignment:", joined["SID"].nunique())
+
+        results = hit_rate(
+            joined,
+            pred_cols=[RAW, MOS_CORR, ML1_CORR],
+            by="leadtime",
+        )
 
         results["overall"]["model"] = results["overall"]["model"].replace(rename_map)
+
         if "by" in results:
             results["by"]["model"] = results["by"]["model"].replace(rename_map)
 
         print("Overall hit rates:")
         print(results["overall"].to_string(index=False))
-
-        if "by" in results:
-            print("\nHit rate by leadtime:")
 
         overall = results["overall"].copy()
         overall["level"] = "overall"
@@ -335,14 +470,17 @@ def main():
         if "by" in results:
             by_df = results["by"].copy()
             by_df["level"] = "by_leadtime"
-            combined = pd.concat([overall, by_df], ignore_index=True, sort=False)
+            combined = pd.concat(
+                [overall, by_df],
+                ignore_index=True,
+                sort=False,
+            )
         else:
             combined = overall
 
-        out_path = OUT_DIR / f"hit_rate_{MLNAME}.csv"
+        out_path = out_dir / f"hit_rate_{MLNAME}.csv"
         combined.to_csv(out_path, index=False)
         print(f"\nCombined results saved to: {out_path}")
-
 
 if __name__ == "__main__":
     main()

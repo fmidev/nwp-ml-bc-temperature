@@ -5,11 +5,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+import argparse
 
-# Paths
-PATH = Path.home() / "thesis_project" / "data" / "ml_data_full" / "ml_data_full*.parquet"
-OUT  = Path.home() / "thesis_project" / "figures"
-OUT.mkdir(parents=True, exist_ok=True)
 
 # Features/label
 TEMP_FC   = "T2"
@@ -20,60 +17,128 @@ cols      = weather + meta + [LABEL_OBS]
 
 N_SAMPLE = 200_000  # adjust for RAM
 
-# --- Build lazy frame; KEEP columns explicitly, and cast geo/meta numeric
-lf = (
-    pl.scan_parquet(str(PATH))
-    .select(cols)
-    .with_columns(
-        pl.col("analysishour").cast(pl.Int16,   strict=False),
-        pl.col(["lon","lat","elev"]).cast(pl.Float32, strict=False),
-        (pl.col(LABEL_OBS) - pl.col(TEMP_FC)).alias("bias"),
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Create a Spearman correlation heatmap from parquet ML data."
     )
-    # Optional: shrink remaining float columns to Float32 to save RAM
-    .with_columns(cs.float().cast(pl.Float32, strict=False))
-)
 
-# --- Deterministic unbiased “shuffle” using a row index (works on old Polars)
-lf_sampled = (
-    lf.with_row_index("_i")
-      .with_columns(_k=((pl.col("_i") * 1103515245 + 12345) % 2_147_483_647).cast(pl.UInt32))
-      .sort("_k")
-      .head(N_SAMPLE)
-      .drop(["_i","_k"])
-)
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=str,
+        help=(
+            "Input parquet file, directory, or glob pattern. "
+            "Examples: /path/to/ml_data_full/*.parquet or /path/to/ml_data_full"
+        ),
+    )
 
-# --- Collect bounded table then finish in pandas
-df = lf_sampled.collect(engine="streaming").to_pandas()
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=str,
+        help="Directory where the correlation heatmap will be saved.",
+    )
 
-# Make 100% sure lon/lat/elev are numeric in pandas too
-for c in ["lon", "lat", "elev", "analysishour"]:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    parser.add_argument(
+        "--output-name",
+        default="correlation_map.svg",
+        type=str,
+        help="Name of the output figure file. Default: correlation_map.svg",
+    )
 
-# If a column is entirely NaN after coercion (e.g., missing in some parquet parts),
-# you’ll still keep it—Spearman will just yield NaNs for that column.
-# Compute correlation on numeric columns:
-corr = df.corr(method="spearman", numeric_only=True)
+    parser.add_argument(
+        "--sample-size",
+        default=200_000,
+        type=int,
+        help="Number of rows to sample before computing correlations. Default: 200000.",
+    )
 
-# If you want to guarantee these columns appear even if NaN/constant,
-# reindex the corr matrix to include them:
-must_have = [c for c in ["lon","lat","elev"] if c in df.columns]
-corr = corr.reindex(index=corr.index.union(must_have), columns=corr.columns.union(must_have))
+    return parser.parse_args()
 
-# Plot
-plt.figure(figsize=(10, 8))
-im = plt.imshow(corr, aspect='auto', cmap="coolwarm")
-plt.colorbar(im, fraction=0.046, pad=0.04)
-plt.xticks(range(len(corr.columns)), corr.columns, rotation=90)
-plt.yticks(range(len(corr.index)), corr.index)
-plt.title("Feature/Target Correlation (Spearman)", fontsize=20)
-plt.tight_layout()
-plt.savefig(OUT / "correlation_map.svg", dpi=200)
+def resolve_input_path(input_arg):
+    input_path = Path(input_arg)
 
-# Quick sanity check printouts (optional)
-print("Columns present:", sorted(df.columns.tolist()))
-print("dtypes (subset):", df[["lon","lat","elev"]].dtypes if set(["lon","lat","elev"]).issubset(df.columns) else "geo columns missing")
-print(corr.loc[must_have, ["bias"]].sort_values(by="bias", ascending=False) if must_have else "No geo in corr")
+    if input_path.is_dir():
+        return str(input_path / "*.parquet")
+
+    return str(input_path)
 
 
+def main():
+    args = parse_args()
 
+    parquet_path = resolve_input_path(args.input)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build lazy frame; KEEP columns explicitly, and cast geo/meta numeric
+    lf = (
+        pl.scan_parquet(parquet_path)
+        .select(cols)
+        .with_columns(
+            pl.col("analysishour").cast(pl.Int16, strict=False),
+            pl.col(["lon", "lat", "elev"]).cast(pl.Float32, strict=False),
+            (pl.col(LABEL_OBS) - pl.col(TEMP_FC)).alias("bias"),
+        )
+        # Optional: shrink remaining float columns to Float32 to save RAM
+        .with_columns(cs.float().cast(pl.Float32, strict=False))
+    )
+
+    # Deterministic unbiased “shuffle” using a row index
+    lf_sampled = (
+        lf.with_row_index("_i")
+          .with_columns(
+              _k=((pl.col("_i") * 1103515245 + 12345) % 2_147_483_647)
+              .cast(pl.UInt32)
+          )
+          .sort("_k")
+          .head(args.sample_size)
+          .drop(["_i", "_k"])
+    )
+
+    # Collect bounded table then finish in pandas
+    df = lf_sampled.collect(engine="streaming").to_pandas()
+
+    # Make sure lon/lat/elev are numeric in pandas too
+    for c in ["lon", "lat", "elev", "analysishour"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Compute correlation on numeric columns
+    corr = df.corr(method="spearman", numeric_only=True)
+
+    # Guarantee these columns appear even if NaN/constant
+    must_have = [c for c in ["lon", "lat", "elev"] if c in df.columns]
+    corr = corr.reindex(
+        index=corr.index.union(must_have),
+        columns=corr.columns.union(must_have),
+    )
+
+    # Plot
+    plt.figure(figsize=(10, 8))
+    im = plt.imshow(corr, aspect="auto", cmap="coolwarm")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=90)
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.title("Feature/Target Correlation (Spearman)", fontsize=20)
+    plt.tight_layout()
+
+    output_path = out_dir / args.output_name
+    plt.savefig(output_path, dpi=200)
+
+    print("Saved to:", output_path)
+    print("Columns present:", sorted(df.columns.tolist()))
+
+    if set(["lon", "lat", "elev"]).issubset(df.columns):
+        print("dtypes (subset):", df[["lon", "lat", "elev"]].dtypes)
+    else:
+        print("geo columns missing")
+
+    if must_have:
+        print(corr.loc[must_have, ["bias"]].sort_values(by="bias", ascending=False))
+    else:
+        print("No geo in corr")
+
+if __name__ == "__main__":
+    main()

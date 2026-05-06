@@ -1,16 +1,14 @@
+import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import json
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timedelta, UTC
 import numpy as np
 import polars as pl
 import xgboost as xgb
 import optuna
-import optuna.visualization as vis
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta, UTC
 
 
 # Silence specific warning 
@@ -22,11 +20,9 @@ warnings.filterwarnings(
     module="optuna.trial._trial"
 )
 
-# Paths
-PATH = Path.home() / "thesis_project" / "data" / "ml_data_full" / "ml_data_full_*.parquet"
+# Column names
 LABEL_OBS = "obs_TA"
-TEMP_FC   = "T2"
-OUT = Path.home() / "thesis_project" / "figures"
+TEMP_FC = "T2"
 
 
 # Features
@@ -81,32 +77,71 @@ SPATIAL_MAX_W = 10.0
 # Data loading and processing functions
 # -----------------------------------------
 
-def load_dataset():
-    """
-    Helper function to read the dataset from the parquet file.
-        - Reads the needed columns
-        - Filters out the missing observed or predicted temperature values
-        - Changes the analysistime to datetime type
-    Returns:
-        Dataframe of the data"""
-    
-    # Read the file and get needed columns
-    lf = pl.scan_parquet(str(PATH)).select(FEATS + [LABEL_OBS, "analysistime", STATION_ID_COL, "validtime"])
-
-    # Change analysistime to datetime type
-    lf = lf.with_columns(
-        pl.col("analysistime").str.strptime(pl.Datetime, strict=False).alias("analysistime_dt"),
-        pl.col("validtime").str.strptime(pl.Datetime, strict=False).alias("validtime_dt")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train an XGBoost bias-correction model from parquet input data."
     )
 
-    # Change analysishour to integer
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=str,
+        help=(
+            "Input parquet file, directory, or glob pattern. "
+            "Examples: data/ml_data_full/*.parquet or data/ml_data_full/ml_data_full_*.parquet"
+        ),
+    )
+
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=str,
+        help="Output directory where model files, metadata, and figures will be saved.",
+    )
+
+    parser.add_argument(
+        "--cuda-device",
+        default="1",
+        type=str,
+        help="CUDA device id to use. Default: 1. Use empty string to let XGBoost decide.",
+    )
+
+    return parser.parse_args()
+
+
+def load_dataset(input_path):
+    """
+    Read the dataset from parquet input.
+
+    input_path can be:
+      - a single parquet file
+      - a directory containing parquet files
+      - a glob pattern such as /path/to/data/*.parquet
+    """
+
+    input_path = Path(input_path)
+
+    if input_path.is_dir():
+        parquet_path = str(input_path / "*.parquet")
+    else:
+        parquet_path = str(input_path)
+
+    lf = pl.scan_parquet(parquet_path).select(
+        FEATS + [LABEL_OBS, "analysistime", STATION_ID_COL, "validtime"]
+    )
+
+    lf = lf.with_columns(
+        pl.col("analysistime").str.strptime(pl.Datetime, strict=False).alias("analysistime_dt"),
+        pl.col("validtime").str.strptime(pl.Datetime, strict=False).alias("validtime_dt"),
+    )
+
     lf = lf.with_columns(pl.col("analysishour").cast(pl.Int8))
 
-    # Filter out the rows with missing temperature values
     df = (
         lf.filter(pl.col(LABEL_OBS).is_not_null() & pl.col(TEMP_FC).is_not_null())
           .collect(engine="streaming")
     )
+
     return df
 
 def to_xy_bias(df_pl):
@@ -373,9 +408,18 @@ def main():
     np.random.seed(RANDOM_SEED)
     BIN = 256
 
-    # Load the data and split into train/validation and test sets 
-    # and create folds for the train/validation set
-    df = load_dataset()
+    args = parse_args()
+
+    if args.cuda_device != "":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_device
+
+    input_path = args.input
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    np.random.seed(RANDOM_SEED)
+
+    df = load_dataset(input_path)
     folds, df_test = split_trainval_test(df)
 
     # Loop through the folds 
@@ -468,12 +512,12 @@ def main():
         weight_meta["station_list"] = {"enabled": False}
 
     # Persist metadata (always)
-    with open("weight_meta_2019_sid.json", "w") as f:
+    with open(output_dir / "weight_meta_2019_sid.json", "w") as f:
         json.dump(weight_meta, f, indent=4)    
 
     # Optional: persist for reproducibility
     if weight_hparams:
-        with open("weight_hparams_sid_2019.json", "w") as f:
+        with open(output_dir / "weight_hparams_sid_2019.json", "w") as f:
             json.dump(weight_hparams, f, indent=4)
 
     # --- build refit weights based on the chosen mode ---
@@ -515,7 +559,7 @@ def main():
         dfull = xgb.QuantileDMatrix(X_full, y_full, max_bin=max_bin_eff)
 
 
-    with open("best_params_full_new.json", "w") as f:
+    with open(output_dir / "best_params_full_new.json", "w") as f:
         json.dump(best_params, f, indent=4)
 
     bst = xgb.train(
@@ -530,7 +574,7 @@ def main():
     print("Refit best_iteration:", bst.best_iteration, "| best_score:", bst.best_score)
 
     # Save model
-    bst.save_model("bias_model_tuned_full_new.json")
+    bst.save_model(output_dir / "bias_model_tuned_full_new.json")
 
     # Quick test-year report (bias RMSE)
     X_test, y_test = to_xy_bias(df_test)
@@ -542,10 +586,17 @@ def main():
     from optuna.visualization.matplotlib import plot_param_importances, plot_optimization_history
 
     fig1 = plot_param_importances(study)
-    fig1.figure.savefig(OUT / "param_importances_tuned_full_new.png", dpi=200, bbox_inches="tight")
+    fig1.figure.savefig(
+        output_dir / "param_importances_tuned_full_new.png",
+        dpi=200,
+        bbox_inches="tight",
+    )
 
     fig2 = plot_optimization_history(study)
-    fig2.figure.savefig(OUT / "optimization_history_tuned_full_new.png", dpi=200, bbox_inches="tight")
-
+    fig2.figure.savefig(
+        output_dir / "optimization_history_tuned_full_new.png",
+        dpi=200,
+        bbox_inches="tight",
+    )
 if __name__ == "__main__":
     main() 
