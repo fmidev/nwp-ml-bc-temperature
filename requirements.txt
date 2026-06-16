@@ -1,0 +1,11 @@
+# Minimal dependencies for the preop_model_train branch
+numpy
+pandas
+polars
+pyarrow
+xgboost
+matplotlib
+geopandas
+
+# Optional: needed only when running xgboost_train_cpu.py with --tune
+# optuna
