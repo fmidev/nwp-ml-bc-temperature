@@ -4,6 +4,10 @@ Machine learning workflows for bias-correcting near-surface temperature forecast
 
 This repository contains research scripts for training, running inference, evaluating, and visualizing machine-learning-based temperature bias correction models.
 
+## Branhc note: preop_model_train
+
+This branch contains the model training (and minimal testing) for the operational XGB correction to T2, D2 TMAX12H and TMIN12H on the full dataset. 
+
 ## Branch note: configurable scripts
 
 The branch, `configurable_scipts`, contains updated versions of the scripts where hardcoded local paths have been replaced with command-line arguments.
