@@ -10,6 +10,10 @@ import numpy as np
 import pyarrow.parquet as pq
 import xgboost as xgb
 
+# This training entrypoint is intentionally narrow: it expects already-cleaned
+# monthly parquet files and trains CPU XGBoost models through the external-memory
+# API so we do not have to materialize the full dataset in RAM at once.
+
 try:
     import optuna
     HAS_OPTUNA = True
@@ -29,12 +33,25 @@ TMIN_FC = "MN2T"
 
 DEFAULT_TARGET_COL = "target_bias_TA"
 
+# Map each supported learning target to the forecast field it corrects. This is
+# metadata for logs/reports; the training label itself still comes from
+# --target-col in the parquet files.
 KNOWN_TARGET_TO_BASE_FC = {
     "target_bias": TEMP_FC,
     "target_bias_TA": TEMP_FC,
     "target_bias_TD": DEW_FC,
     "target_bias_TMAX": TMAX_FC,
     "target_bias_TMIN": TMIN_FC,
+}
+
+# Canonical output model filenames. Operational inference scripts expect these
+# stable names instead of the older verbose training artifact names.
+MODEL_BASENAME_BY_TARGET = {
+    "target_bias": "XGB_T2",
+    "target_bias_TA": "XGB_T2",
+    "target_bias_TD": "XGB_TD",
+    "target_bias_TMAX": "XGB_TMAX",
+    "target_bias_TMIN": "XGB_TMIN",
 }
 
 weather = [
@@ -48,6 +65,8 @@ meta = [
     "analysishour",
 ]
 
+# Keep feature order fixed so training, validation, and later inference all feed
+# XGBoost the columns in the same order.
 FEATS = weather + meta
 
 RANDOM_SEED = 42
@@ -275,6 +294,7 @@ def list_parquet_files(input_path):
     p = Path(input_path)
     input_str = str(p)
 
+    # Accept a directory of monthly files, a glob pattern, or a single file path.
     if p.is_dir():
         files = sorted(p.glob("*.parquet"))
     elif any(ch in input_str for ch in ["*", "?", "["]):
@@ -316,6 +336,8 @@ def month_from_filename(path):
 def get_max_month_datetime_from_files(parquet_files):
     months = [month_from_filename(p) for p in parquet_files]
     max_month = max(months)
+    # Convert the last YYYY-MM seen in filenames into the final timestamp of that
+    # month so validation/test cutoffs can be derived without opening all data.
     month_start = datetime.strptime(max_month + "-01", "%Y-%m-%d")
     next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
     return next_month - timedelta(seconds=1)
@@ -332,6 +354,8 @@ def split_files_by_month_from_name(parquet_files, train_end, test_start):
     for path in parquet_files:
         month = month_from_filename(path)
 
+        # YYYY-MM strings are lexicographically sortable, so string comparison is
+        # enough to bucket monthly files into train/valid/test windows.
         if month < train_end_month:
             train_files.append(path)
         elif month < test_start_month:
@@ -376,6 +400,8 @@ def load_fixed_params(params_json=None, nthread=0):
         params = dict(DEFAULT_XGB_PARAMS)
 
     params = dict(params)
+    # These core settings define the supported training mode for this script,
+    # even when the caller supplies extra params from JSON.
     params.update({
         "objective": "reg:squarederror",
         "tree_method": "hist",
@@ -517,6 +543,8 @@ class CleanParquetCpuIter(xgb.DataIter):
         self.progress_every = int(progress_every)
         self.columns = unique_keep_order(self.feature_cols + [self.target_col])
 
+        # DataIter is stateful: XGBoost will call reset() and then repeatedly
+        # call next() until it returns 0.
         self._file_idx = 0
         self._batch_iter = None
         self._batch_count = 0
@@ -548,6 +576,8 @@ class CleanParquetCpuIter(xgb.DataIter):
         if missing:
             raise ValueError(f"Missing columns in {path}: {missing}")
 
+        # Arrow yields row-group batches lazily, which is what makes the
+        # external-memory pipeline work for large monthly parquet files.
         self._batch_iter = pf.iter_batches(
             batch_size=self.batch_size,
             columns=self.columns,
@@ -579,6 +609,8 @@ class CleanParquetCpuIter(xgb.DataIter):
                 gc.collect()
                 continue
 
+            # Convert one batch at a time to NumPy and hand it directly to
+            # XGBoost; we never accumulate multiple batches in memory here.
             X = table[self.feature_cols].to_numpy(dtype=np.float32, copy=False)
             y = table[self.target_col].to_numpy(dtype=np.float32, copy=False)
 
@@ -610,6 +642,8 @@ def evaluate_batched_cpu(bst, parquet_files, target_col, batch_size):
     n = 0
     columns = unique_keep_order(FEATS + [target_col])
 
+    # Mirror the training-side batching so test evaluation also stays bounded in
+    # memory even for large held-out monthly files.
     for file_idx, path in enumerate(parquet_files, start=1):
         print(f"[Eval:{target_col}] opening file {file_idx}/{len(parquet_files)}: {path}", flush=True)
 
@@ -670,6 +704,9 @@ def tune_params_external_memory(args, base_params, dtrain, dvalid, output_dir, t
     def objective(trial):
         params = make_trial_params(trial, base_params, args)
 
+        # Reuse the already-built external-memory matrices for each trial. That
+        # keeps tuning practical on large datasets, but also means max_bin must
+        # stay fixed across trials.
         bst = xgb.train(
             params,
             dtrain,
@@ -756,9 +793,12 @@ def run_cpu_external_memory(args, input_path, output_dir):
 
     target_col = args.target_col
     target_safe = safe_name(target_col)
+    model_basename = MODEL_BASENAME_BY_TARGET.get(target_col, f"XGB_{target_safe}")
     base_fc_col = KNOWN_TARGET_TO_BASE_FC.get(target_col)
 
     parquet_files = list_parquet_files(input_path)
+    # Fail fast on schema problems before spending time building cache files and
+    # QuantileDMatrices from many monthly parquet inputs.
     check_required_columns(parquet_files, target_col)
 
     print("Number of parquet files:", len(parquet_files), flush=True)
@@ -773,6 +813,8 @@ def run_cpu_external_memory(args, input_path, output_dir):
     print("Validation start / train end:", train_end, flush=True)
     print("Test cutoff:", test_start, flush=True)
 
+    # The default split is time-based by month name so evaluation stays strictly
+    # out-of-sample relative to the most recent data.
     if args.all_files_train:
         train_files = parquet_files
         valid_files = []
@@ -807,6 +849,8 @@ def run_cpu_external_memory(args, input_path, output_dir):
     base_params = load_fixed_params(args.params_json, nthread=args.nthread)
     print("Base/fixed params:", base_params, flush=True)
 
+    # XGBoost writes its external-memory cache here while constructing the
+    # training and validation matrices.
     cache_dir = Path(args.cache_dir) if args.cache_dir is not None else output_dir / f"xgb_cpu_cache_{target_safe}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -867,6 +911,8 @@ def run_cpu_external_memory(args, input_path, output_dir):
     optuna_summary = None
     final_params = dict(base_params)
 
+    # Optional tuning happens after matrices are built so trials can reuse the
+    # same cached data instead of rebuilding from parquet each time.
     if args.tune:
         final_params, optuna_summary = tune_params_external_memory(
             args=args,
@@ -882,7 +928,7 @@ def run_cpu_external_memory(args, input_path, output_dir):
         if not args.tune
         else f"best_params_cpu_external_memory_{target_safe}.json"
     )
-    model_filename = f"bias_model_cpu_external_memory_{target_safe}.json"
+    model_filename = f"{model_basename}.json"
 
     with open(output_dir / params_filename, "w") as f:
         json.dump(final_params, f, indent=4)
@@ -890,6 +936,8 @@ def run_cpu_external_memory(args, input_path, output_dir):
     print("Training final model using CPU external memory...", flush=True)
     print("Final params:", final_params, flush=True)
 
+    # Final training uses the tuned params if tuning ran; otherwise it uses the
+    # fixed/default params loaded earlier.
     if dvalid is not None:
         bst = xgb.train(
             final_params,
@@ -911,15 +959,6 @@ def run_cpu_external_memory(args, input_path, output_dir):
     model_path = output_dir / model_filename
     bst.save_model(model_path)
 
-    # Also save a generic filename only when it will not overwrite another target accidentally.
-    generic_model_path = output_dir / "bias_model_cpu_external_memory.json"
-    if target_col in ("target_bias", "target_bias_TA"):
-        try:
-            bst.save_model(generic_model_path)
-            print("Saved generic TA-compatible model:", generic_model_path, flush=True)
-        except Exception as exc:
-            print(f"[WARN] Could not save generic model alias: {exc}", flush=True)
-
     print("Saved model:", model_path, flush=True)
     print("Best iteration:", getattr(bst, "best_iteration", None), flush=True)
     print("Best validation score:", getattr(bst, "best_score", None), flush=True)
@@ -935,6 +974,8 @@ def run_cpu_external_memory(args, input_path, output_dir):
         )
         print("TEST bias RMSE:", rmse_test_bias, flush=True)
 
+    # Write a compact training report alongside the model so downstream runs can
+    # inspect what target, split, params, and cache settings produced it.
     report = {
         "timestamp": datetime.now(UTC).isoformat(),
         "external_memory": True,
@@ -949,7 +990,7 @@ def run_cpu_external_memory(args, input_path, output_dir):
         "best_iteration": getattr(bst, "best_iteration", None),
         "best_score": getattr(bst, "best_score", None),
         "model_file": model_filename,
-        "generic_model_file": str(generic_model_path.name) if target_col in ("target_bias", "target_bias_TA") else None,
+        "generic_model_file": None,
         "params_file": params_filename,
         "max_month_approx": str(max_vt),
         "train_end": str(train_end),
